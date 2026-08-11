@@ -246,19 +246,23 @@ impl Gfx {
                 .unwrap();
             let format = pick_format(&formats, 8);
 
-            // Multisampling: 4x unless NACELLE_MSAA says otherwise,
-            // and never more than the device's colour attachments can
-            // hold. This is a quality setting like the colour depth —
-            // the environment variable is the hand on it until the
-            // settings panel grows one.
+            // Multisampling: OFF by default. Four samples buy four
+            // coverage levels, and on a shallow curve four levels are
+            // four visible bands — the staircase does not go away, it
+            // becomes four smaller staircases, which is exactly what
+            // the eye reports and what the level counts missed. The
+            // answer is analytic coverage (the vector path), not more
+            // samples; this stays as an option for whoever wants it,
+            // and as a net for the geometry no formula describes.
+            // NACELLE_MSAA is the hand on it: 1 (off), 2, 4, 8.
             let msaa_pref = std::env::var("NACELLE_MSAA")
                 .ok()
                 .and_then(|v| v.trim().parse::<u32>().ok())
                 .map(|v| match v {
                     1 | 2 | 4 | 8 => v,
-                    _ => 4,
+                    _ => 1,
                 })
-                .unwrap_or(4);
+                .unwrap_or(1);
             let samples = pick_samples(&instance, pdevice, msaa_pref);
             announce_samples(msaa_pref, samples);
 
