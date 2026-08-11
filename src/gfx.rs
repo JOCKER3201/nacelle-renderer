@@ -63,6 +63,21 @@ pub struct Gfx {
     views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
     framebuffers: Vec<vk::Framebuffer>,
+    /// Requested multisampling: 1 (off), 2, 4 or 8. What the device
+    /// actually grants lives in `samples`.
+    msaa_pref: u32,
+    /// The sample count the render passes and the pipelines are built
+    /// with right now — already checked against the device's
+    /// `framebuffer_color_sample_counts`.
+    samples: vk::SampleCountFlags,
+    /// The multisample colour attachment every geometry pass draws
+    /// into; the swapchain image (and the glass chain's base target)
+    /// is only the resolve destination. Null when MSAA is off. One
+    /// image serves both passes: they run one after the other in the
+    /// same command buffer and each clears it.
+    msaa_image: vk::Image,
+    msaa_mem: vk::DeviceMemory,
+    msaa_view: vk::ImageView,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     pipeline_image: vk::Pipeline,
@@ -71,10 +86,20 @@ pub struct Gfx {
     /// ADD_ATLAS compose with light. Destination alpha stays untouched,
     /// which is what a passthrough swapchain will need (r1 R1/R8).
     pipeline_add: vk::Pipeline,
-    /// Offscreen pass for the frosted-glass chain: same format as the
-    /// swapchain (which is what lets the ordinary pipelines draw into
-    /// it), ending in a shader-readable layout.
+    /// fs_image at one sample, compiled against `pyramid_pass`: the
+    /// only pipeline the resampling steps need, and the one that must
+    /// NOT follow the main pass's sample count.
+    pipeline_image_1x: vk::Pipeline,
+    /// Offscreen pass for the frosted-glass chain's BASE SCENE: same
+    /// format and same sample count as the main pass (which is what
+    /// lets the ordinary pipelines draw into it), ending in a
+    /// shader-readable layout — resolved, when MSAA is on, so the
+    /// pyramid samples flat pixels and the glass looks the same.
     blur_pass: vk::RenderPass,
+    /// The pyramid's own pass: one sample always. Its steps only
+    /// stretch one target over the next, and multisampling a resample
+    /// would cost memory for nothing.
+    pyramid_pass: vk::RenderPass,
     /// scene (full size), half, quarter, eighth — in that order.
     blur_targets: Vec<BlurTarget>,
     /// How deep the pyramid goes (1..=3): half, quarter, or eighth
@@ -221,8 +246,26 @@ impl Gfx {
                 .unwrap();
             let format = pick_format(&formats, 8);
 
-            let render_pass = create_render_pass(&device, format.format);
-            let blur_pass = create_blur_pass(&device, format.format);
+            // Multisampling: 4x unless NACELLE_MSAA says otherwise,
+            // and never more than the device's colour attachments can
+            // hold. This is a quality setting like the colour depth —
+            // the environment variable is the hand on it until the
+            // settings panel grows one.
+            let msaa_pref = std::env::var("NACELLE_MSAA")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .map(|v| match v {
+                    1 | 2 | 4 | 8 => v,
+                    _ => 4,
+                })
+                .unwrap_or(4);
+            let samples = pick_samples(&instance, pdevice, msaa_pref);
+            announce_samples(msaa_pref, samples);
+
+            let render_pass = create_render_pass(&device, format.format, samples);
+            let blur_pass = create_blur_pass(&device, format.format, samples);
+            let pyramid_pass =
+                create_blur_pass(&device, format.format, vk::SampleCountFlags::TYPE_1);
 
             // Descriptors: atlas texture (binding 0) + sampler (binding 1),
             // because WGSL has no combined image sampler.
@@ -291,7 +334,14 @@ impl Gfx {
                 )
                 .unwrap();
 
-            let pipes = create_pipeline(&device, render_pass, desc_layout, lut_layout);
+            let pipes = create_pipeline(
+                &device,
+                render_pass,
+                pyramid_pass,
+                samples,
+                desc_layout,
+                lut_layout,
+            );
 
             // Room for the application's images: browser frames,
             // previews, a wallpaper. Freed individually as images go.
@@ -473,12 +523,19 @@ impl Gfx {
                 views: vec![],
                 render_pass,
                 framebuffers: vec![],
+                msaa_pref,
+                samples,
+                msaa_image: vk::Image::null(),
+                msaa_mem: vk::DeviceMemory::null(),
+                msaa_view: vk::ImageView::null(),
                 pipeline_layout: pipes.layout,
                 pipeline: pipes.atlas,
                 pipeline_image: pipes.image,
                 pipeline_blur: pipes.blur,
                 pipeline_add: pipes.add,
+                pipeline_image_1x: pipes.image_1x,
                 blur_pass,
+                pyramid_pass,
                 blur_targets: Vec::new(),
                 blur_depth: 3,
                 text_gamma: 1.0,
@@ -540,6 +597,29 @@ impl Gfx {
         }
     }
 
+    /// Asks for a multisampling level: 1 (off), 2, 4 or 8 samples per
+    /// pixel. Anything else reads as 4, the default. A device that
+    /// cannot hold that many samples in a colour attachment gets the
+    /// nearest one below. Takes effect at the next swapchain rebuild;
+    /// pass through [`Gfx::resize`] to force one.
+    pub fn set_msaa(&mut self, samples: u32) {
+        let pref = match samples {
+            1 | 2 | 4 | 8 => samples,
+            _ => 4,
+        };
+        if pref != self.msaa_pref {
+            self.msaa_pref = pref;
+            self.needs_recreate = true;
+        }
+    }
+
+    /// The sample count the renderer is actually drawing with — the
+    /// preference already clamped to what this device offers. 1 means
+    /// multisampling is off.
+    pub fn msaa(&self) -> u32 {
+        samples_to_count(self.samples)
+    }
+
     /// The theme's glyph-coverage exponent (render.text_gamma). Clamped to
     /// the token's own stated range; 0 (the engine's kind fallback when no
     /// theme declares it) means identity.
@@ -576,46 +656,67 @@ impl Gfx {
                 self.device.destroy_image_view(v, None);
             }
 
-            // The depth preference may have moved since the last
-            // build. A new format means a new render pass and new
-            // pipelines — they are compiled against it.
-            if let Ok(formats) = self
+            self.destroy_msaa_target();
+
+            // The depth preference or the multisampling level may have
+            // moved since the last build. A new format or a new sample
+            // count means new render passes and new pipelines — they
+            // are compiled against both.
+            let want_format = match self
                 .surface_loader
                 .get_physical_device_surface_formats(self.pdevice, self.surface)
             {
-                let want = pick_format(&formats, self.depth_pref);
-                if want.format != self.format.format
-                    || want.color_space != self.format.color_space
-                {
+                Ok(formats) => pick_format(&formats, self.depth_pref),
+                Err(_) => self.format,
+            };
+            let want_samples = pick_samples(&self.instance, self.pdevice, self.msaa_pref);
+            let new_format = want_format.format != self.format.format
+                || want_format.color_space != self.format.color_space;
+            if new_format || want_samples != self.samples {
+                if new_format {
                     eprintln!(
                         "nacelle-desktop: swapchain format {:?} ({:?})",
-                        want.format, want.color_space
+                        want_format.format, want_format.color_space
                     );
-                    self.format = want;
-                    self.device.destroy_pipeline(self.pipeline, None);
-                    self.device.destroy_pipeline(self.pipeline_image, None);
-                    self.device.destroy_pipeline(self.pipeline_blur, None);
-                    self.device.destroy_pipeline(self.pipeline_add, None);
-                    self.device
-                        .destroy_pipeline_layout(self.pipeline_layout, None);
-                    self.device.destroy_render_pass(self.render_pass, None);
-                    self.device.destroy_render_pass(self.blur_pass, None);
-                    self.render_pass =
-                        create_render_pass(&self.device, self.format.format);
-                    self.blur_pass =
-                        create_blur_pass(&self.device, self.format.format);
-                    let pipes = create_pipeline(
-                        &self.device,
-                        self.render_pass,
-                        self.desc_layout,
-                        self.lut_layout,
-                    );
-                    self.pipeline_layout = pipes.layout;
-                    self.pipeline = pipes.atlas;
-                    self.pipeline_image = pipes.image;
-                    self.pipeline_blur = pipes.blur;
-                    self.pipeline_add = pipes.add;
                 }
+                if want_samples != self.samples {
+                    announce_samples(self.msaa_pref, want_samples);
+                }
+                self.format = want_format;
+                self.samples = want_samples;
+                self.device.destroy_pipeline(self.pipeline, None);
+                self.device.destroy_pipeline(self.pipeline_image, None);
+                self.device.destroy_pipeline(self.pipeline_blur, None);
+                self.device.destroy_pipeline(self.pipeline_add, None);
+                self.device.destroy_pipeline(self.pipeline_image_1x, None);
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+                self.device.destroy_render_pass(self.render_pass, None);
+                self.device.destroy_render_pass(self.blur_pass, None);
+                self.device.destroy_render_pass(self.pyramid_pass, None);
+                self.render_pass =
+                    create_render_pass(&self.device, self.format.format, self.samples);
+                self.blur_pass =
+                    create_blur_pass(&self.device, self.format.format, self.samples);
+                self.pyramid_pass = create_blur_pass(
+                    &self.device,
+                    self.format.format,
+                    vk::SampleCountFlags::TYPE_1,
+                );
+                let pipes = create_pipeline(
+                    &self.device,
+                    self.render_pass,
+                    self.pyramid_pass,
+                    self.samples,
+                    self.desc_layout,
+                    self.lut_layout,
+                );
+                self.pipeline_layout = pipes.layout;
+                self.pipeline = pipes.atlas;
+                self.pipeline_image = pipes.image;
+                self.pipeline_blur = pipes.blur;
+                self.pipeline_add = pipes.add;
+                self.pipeline_image_1x = pipes.image_1x;
             }
 
             let caps = self
@@ -631,6 +732,15 @@ impl Gfx {
                 }
             };
             if extent.width == 0 || extent.height == 0 {
+                // The surface has no pixels right now. Everything the
+                // old size owned is already gone above — including the
+                // multisample attachment the glass chain's base
+                // framebuffer points at — so the chain goes with it,
+                // and the zero extent is what tells `render` to skip
+                // the frame until a real size arrives. `needs_recreate`
+                // stays set, so it will.
+                self.destroy_blur_targets();
+                self.extent = extent;
                 return;
             }
             let mut image_count = caps.min_image_count + 1;
@@ -660,6 +770,7 @@ impl Gfx {
                 self.swapchain_loader.destroy_swapchain(old, None);
             }
             self.extent = extent;
+            self.create_msaa_target();
             self.images = self
                 .swapchain_loader
                 .get_swapchain_images(self.swapchain)
@@ -677,7 +788,10 @@ impl Gfx {
                     )
                     .unwrap();
                 self.views.push(view);
-                let attachments = [view];
+                // With MSAA the swapchain image is attachment 1, the
+                // resolve destination; the samples live in attachment
+                // 0 and are never stored.
+                let attachments = self.attachments_for(view);
                 let fb = self
                     .device
                     .create_framebuffer(
@@ -694,6 +808,93 @@ impl Gfx {
             }
             self.rebuild_blur_targets();
             self.needs_recreate = false;
+        }
+    }
+
+    /// The colour attachments a full-size framebuffer of the main or
+    /// the base-scene pass is made of: the resolve target alone when
+    /// multisampling is off, the shared multisample image in front of
+    /// it when it is on.
+    fn attachments_for(&self, resolve: vk::ImageView) -> Vec<vk::ImageView> {
+        if self.samples == vk::SampleCountFlags::TYPE_1 {
+            vec![resolve]
+        } else {
+            vec![self.msaa_view, resolve]
+        }
+    }
+
+    /// Builds the one multisample colour image the frame draws into —
+    /// full surface size, `samples` deep. It is transient: no pass
+    /// ever stores it, so a driver that can keep it in tile memory is
+    /// told it may (LAZILY_ALLOCATED), and one that cannot spends
+    /// ordinary device-local memory instead.
+    unsafe fn create_msaa_target(&mut self) {
+        if self.samples == vk::SampleCountFlags::TYPE_1 {
+            return;
+        }
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(self.format.format)
+            .extent(vk::Extent3D {
+                width: self.extent.width,
+                height: self.extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(self.samples)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::TRANSIENT_ATTACHMENT,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = self.device.create_image(&info, None).unwrap();
+        let req = self.device.get_image_memory_requirements(image);
+        let mem = alloc_memory_opt(
+            &self.device,
+            &self.mem_props,
+            req,
+            vk::MemoryPropertyFlags::LAZILY_ALLOCATED,
+        )
+        .unwrap_or_else(|| {
+            alloc_memory(
+                &self.device,
+                &self.mem_props,
+                req,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+        });
+        self.device.bind_image_memory(image, mem, 0).unwrap();
+        let view = self
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(self.format.format)
+                    .subresource_range(color_range()),
+                None,
+            )
+            .unwrap();
+        self.msaa_image = image;
+        self.msaa_mem = mem;
+        self.msaa_view = view;
+    }
+
+    unsafe fn destroy_msaa_target(&mut self) {
+        if self.msaa_view != vk::ImageView::null() {
+            self.device.destroy_image_view(self.msaa_view, None);
+            self.msaa_view = vk::ImageView::null();
+        }
+        if self.msaa_image != vk::Image::null() {
+            self.device.destroy_image(self.msaa_image, None);
+            self.msaa_image = vk::Image::null();
+        }
+        if self.msaa_mem != vk::DeviceMemory::null() {
+            self.device.free_memory(self.msaa_mem, None);
+            self.msaa_mem = vk::DeviceMemory::null();
         }
     }
 
@@ -737,12 +938,20 @@ impl Gfx {
                     None,
                 )
                 .unwrap();
-            let attachments = [view];
+            // Target 0 is the base scene: real geometry, so it is the
+            // one that carries the multisample attachment and resolves
+            // into itself. The pyramid levels below it only stretch
+            // one picture over the next, and stay flat.
+            let (pass, attachments) = if div == 1 {
+                (self.blur_pass, self.attachments_for(view))
+            } else {
+                (self.pyramid_pass, vec![view])
+            };
             let fb = self
                 .device
                 .create_framebuffer(
                     &vk::FramebufferCreateInfo::default()
-                        .render_pass(self.blur_pass)
+                        .render_pass(pass)
                         .attachments(&attachments)
                         .width(tw)
                         .height(th)
@@ -960,7 +1169,7 @@ impl Gfx {
                 // applied once, at composite.
                 self.push_pc(cmd, self.extent.width as f32, self.extent.height as f32, 0.0);
                 let t0 = (self.blur_targets[0].fb, self.blur_targets[0].w, self.blur_targets[0].h);
-                self.begin_blur_pass(cmd, t0.0, t0.1, t0.2, clear);
+                self.begin_blur_pass(cmd, self.blur_pass, t0.0, t0.1, t0.2, clear);
                 self.record_runs(cmd, 0, base, runs, (t0.1, t0.2), false);
                 self.device.cmd_end_render_pass(cmd);
                 // Down the pyramid: each level is the previous one
@@ -975,11 +1184,13 @@ impl Gfx {
                         self.blur_targets[dst].w,
                         self.blur_targets[dst].h,
                     );
-                    self.begin_blur_pass(cmd, fb, w, h, [0.0; 4]);
+                    self.begin_blur_pass(cmd, self.pyramid_pass, fb, w, h, [0.0; 4]);
+                    // The pyramid is flat: its own one-sample copy of
+                    // the image pipeline, not the frame's.
                     self.device.cmd_bind_pipeline(
                         cmd,
                         vk::PipelineBindPoint::GRAPHICS,
-                        self.pipeline_image,
+                        self.pipeline_image_1x,
                     );
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
@@ -994,9 +1205,7 @@ impl Gfx {
                 }
             }
 
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue { float32: clear },
-            }];
+            let clear_values = self.clear_values(self.render_pass, clear);
             let rp_info = vk::RenderPassBeginInfo::default()
                 .render_pass(self.render_pass)
                 .framebuffer(self.framebuffers[image_index as usize])
@@ -1110,6 +1319,20 @@ impl Gfx {
         }
     }
 
+    /// One clear value per attachment of `pass`. Only attachment 0 is
+    /// ever cleared, but the array is sized to the pass so the resolve
+    /// slot of a multisample framebuffer is never a missing entry.
+    fn clear_values(&self, pass: vk::RenderPass, clear: [f32; 4]) -> Vec<vk::ClearValue> {
+        let value = vk::ClearValue {
+            color: vk::ClearColorValue { float32: clear },
+        };
+        if self.samples == vk::SampleCountFlags::TYPE_1 || pass == self.pyramid_pass {
+            vec![value]
+        } else {
+            vec![value, value]
+        }
+    }
+
     unsafe fn push_pc(&self, cmd: vk::CommandBuffer, w: f32, h: f32, lut: f32) {
         let push = [w, h, lut, self.text_gamma];
         self.device.cmd_push_constants(
@@ -1124,16 +1347,15 @@ impl Gfx {
     unsafe fn begin_blur_pass(
         &self,
         cmd: vk::CommandBuffer,
+        pass: vk::RenderPass,
         fb: vk::Framebuffer,
         w: u32,
         h: u32,
         clear: [f32; 4],
     ) {
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue { float32: clear },
-        }];
+        let clear_values = self.clear_values(pass, clear);
         let info = vk::RenderPassBeginInfo::default()
-            .render_pass(self.blur_pass)
+            .render_pass(pass)
             .framebuffer(fb)
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
@@ -1730,9 +1952,16 @@ impl Drop for Gfx {
                 d.destroy_image(t.image, None);
                 d.free_memory(t.mem, None);
             }
+            if self.msaa_view != vk::ImageView::null() {
+                d.destroy_image_view(self.msaa_view, None);
+                d.destroy_image(self.msaa_image, None);
+                d.free_memory(self.msaa_mem, None);
+            }
             d.destroy_render_pass(self.blur_pass, None);
+            d.destroy_render_pass(self.pyramid_pass, None);
             d.destroy_pipeline(self.pipeline_blur, None);
             d.destroy_pipeline(self.pipeline_add, None);
+            d.destroy_pipeline(self.pipeline_image_1x, None);
             d.destroy_descriptor_pool(self.tex_pool, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
             d.destroy_descriptor_set_layout(self.desc_layout, None);
@@ -1864,27 +2093,119 @@ fn scissor_for(clip: Option<[f32; 4]>, tw: u32, th: u32) -> [i32; 4] {
     }
 }
 
-fn create_render_pass(device: &ash::Device, format: vk::Format) -> vk::RenderPass {
-    let attachments = [vk::AttachmentDescription::default()
+/// The sample count a request of `want` (1, 2, 4 or 8) comes to on a
+/// device whose colour attachments support `supported`. Never above
+/// the request, never above the device: the nearest supported value
+/// below, and 1 in the worst case — every device supports 1.
+fn clamp_samples(want: u32, supported: vk::SampleCountFlags) -> vk::SampleCountFlags {
+    let ladder = [
+        (8u32, vk::SampleCountFlags::TYPE_8),
+        (4, vk::SampleCountFlags::TYPE_4),
+        (2, vk::SampleCountFlags::TYPE_2),
+    ];
+    for (count, flag) in ladder {
+        if want >= count && supported.contains(flag) {
+            return flag;
+        }
+    }
+    vk::SampleCountFlags::TYPE_1
+}
+
+fn samples_to_count(samples: vk::SampleCountFlags) -> u32 {
+    match samples {
+        vk::SampleCountFlags::TYPE_8 => 8,
+        vk::SampleCountFlags::TYPE_4 => 4,
+        vk::SampleCountFlags::TYPE_2 => 2,
+        _ => 1,
+    }
+}
+
+/// What the device will actually hold in a colour attachment, against
+/// what was asked for.
+fn pick_samples(
+    instance: &ash::Instance,
+    pdevice: vk::PhysicalDevice,
+    want: u32,
+) -> vk::SampleCountFlags {
+    let limits = unsafe { instance.get_physical_device_properties(pdevice) }.limits;
+    clamp_samples(want, limits.framebuffer_color_sample_counts)
+}
+
+/// One line about the multisampling level in force, said only when it
+/// is decided or changes — and saying so plainly when the device could
+/// not give what was asked for.
+fn announce_samples(want: u32, got: vk::SampleCountFlags) {
+    let got = samples_to_count(got);
+    if got == want {
+        eprintln!("nacelle-desktop: MSAA {got}x");
+    } else {
+        eprintln!("nacelle-desktop: MSAA {want}x unsupported, using {got}x");
+    }
+}
+
+/// The pass that ends on screen. Without multisampling it is one
+/// attachment, the swapchain image, drawn straight into. With it,
+/// attachment 0 is the multisample image the triangles land in —
+/// cleared, never stored — and attachment 1 is the swapchain image,
+/// which the subpass's resolve writes once the samples are averaged.
+/// That resolve is where the stair-steps of a chamfer, an arc or a
+/// leaning parallelogram turn into intermediate tones.
+fn create_render_pass(
+    device: &ash::Device,
+    format: vk::Format,
+    samples: vk::SampleCountFlags,
+) -> vk::RenderPass {
+    let msaa = samples != vk::SampleCountFlags::TYPE_1;
+    let color = vk::AttachmentDescription::default()
+        .format(format)
+        .samples(samples)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(if msaa {
+            // Nothing reads the samples after the resolve.
+            vk::AttachmentStoreOp::DONT_CARE
+        } else {
+            vk::AttachmentStoreOp::STORE
+        })
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(if msaa {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::PRESENT_SRC_KHR
+        });
+    let resolve = vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+    let attachments: Vec<vk::AttachmentDescription> =
+        if msaa { vec![color, resolve] } else { vec![color] };
     let color_refs = [vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-    let subpasses = [vk::SubpassDescription::default()
+    let resolve_refs = [vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let mut subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_refs)];
+        .color_attachments(&color_refs);
+    if msaa {
+        subpass = subpass.resolve_attachments(&resolve_refs);
+    }
+    let subpasses = [subpass];
+    // The base-scene pass wrote the same multisample image earlier in
+    // the frame, so this one waits for that write, not only for the
+    // acquired image.
     let deps = [vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
         .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .src_access_mask(vk::AccessFlags::empty())
+        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
         .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
         .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
     unsafe {
@@ -1900,27 +2221,65 @@ fn create_render_pass(device: &ash::Device, format: vk::Format) -> vk::RenderPas
     }
 }
 
-/// The offscreen pass of the frosted-glass chain. Same format as the
+/// The offscreen passes of the frosted-glass chain. Same format as the
 /// swapchain — which is exactly what lets the ordinary pipelines draw
 /// into it (render-pass compatibility is formats and sample counts) —
 /// but it ends shader-readable instead of presentable, and its
 /// dependencies fence the sampling that follows.
-fn create_blur_pass(device: &ash::Device, format: vk::Format) -> vk::RenderPass {
-    let attachments = [vk::AttachmentDescription::default()
+///
+/// Called twice: at the frame's sample count for the base scene, where
+/// real geometry is drawn and the result is RESOLVED before anything
+/// samples it, and at one sample for the pyramid, whose steps only
+/// stretch one flat picture over the next. The resolve is what keeps
+/// the glass looking exactly as it did — the chain never sees a
+/// multisample image, only the averaged one.
+fn create_blur_pass(
+    device: &ash::Device,
+    format: vk::Format,
+    samples: vk::SampleCountFlags,
+) -> vk::RenderPass {
+    let msaa = samples != vk::SampleCountFlags::TYPE_1;
+    let color = vk::AttachmentDescription::default()
+        .format(format)
+        .samples(samples)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(if msaa {
+            vk::AttachmentStoreOp::DONT_CARE
+        } else {
+            vk::AttachmentStoreOp::STORE
+        })
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(if msaa {
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        } else {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        });
+    let resolve = vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
         .store_op(vk::AttachmentStoreOp::STORE)
         .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
         .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        .final_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    let attachments: Vec<vk::AttachmentDescription> =
+        if msaa { vec![color, resolve] } else { vec![color] };
     let color_refs = [vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-    let subpasses = [vk::SubpassDescription::default()
+    let resolve_refs = [vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let mut subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_refs)];
+        .color_attachments(&color_refs);
+    if msaa {
+        subpass = subpass.resolve_attachments(&resolve_refs);
+    }
+    let subpasses = [subpass];
     let deps = [
         // Whoever sampled this image last (the previous frame's
         // composite) must be done before it is overwritten.
@@ -1929,6 +2288,16 @@ fn create_blur_pass(device: &ash::Device, format: vk::Format) -> vk::RenderPass 
             .dst_subpass(0)
             .src_stage_mask(vk::PipelineStageFlags::FRAGMENT_SHADER)
             .src_access_mask(vk::AccessFlags::empty())
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
+        // The multisample image is shared with the main pass, which
+        // wrote it on the previous frame: that write must land before
+        // this one starts.
+        vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
         // And whoever samples it next waits for the write.
@@ -1969,11 +2338,17 @@ struct Pipelines {
     /// light; ZERO/ONE on alpha so destination alpha stays untouched,
     /// which matters under a passthrough swapchain (r1 R1).
     add: vk::Pipeline,
+    /// fs_image at one sample, for the pyramid's flat targets. The
+    /// same shader as `image`; only the multisample state differs,
+    /// because a pipeline's sample count must match its pass's.
+    image_1x: vk::Pipeline,
 }
 
 fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
+    pyramid_pass: vk::RenderPass,
+    samples: vk::SampleCountFlags,
     desc_layout: vk::DescriptorSetLayout,
     lut_layout: vk::DescriptorSetLayout,
 ) -> Pipelines {
@@ -2056,7 +2431,14 @@ fn create_pipeline(
             .cull_mode(vk::CullModeFlags::NONE)
             .front_face(vk::FrontFace::CLOCKWISE)
             .line_width(1.0);
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+        // The frame's sample count, which every pipeline drawing into
+        // the main pass (and into the base-scene pass, its twin) must
+        // carry. Shading stays per fragment: multisampling is here for
+        // the geometric edge, and per-sample shading would blur the
+        // glyph quads it must leave alone.
+        let multisample =
+            vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
+        let multisample_1x = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
@@ -2146,10 +2528,22 @@ fn create_pipeline(
             .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
+        let info_image_1x = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages_image)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample_1x)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .render_pass(pyramid_pass)
+            .subpass(0);
         let pipelines = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
-                &[info, info_image, info_blur, info_add],
+                &[info, info_image, info_blur, info_add, info_image_1x],
                 None,
             )
             .expect("cannot create pipelines");
@@ -2161,6 +2555,7 @@ fn create_pipeline(
             image: pipelines[1],
             blur: pipelines[2],
             add: pipelines[3],
+            image_1x: pipelines[4],
         }
     }
 }
@@ -2290,19 +2685,45 @@ fn pick_format(formats: &[vk::SurfaceFormatKHR], depth: u32) -> vk::SurfaceForma
     formats[0]
 }
 
+fn find_memory_type_opt(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    flags: vk::MemoryPropertyFlags,
+) -> Option<u32> {
+    (0..props.memory_type_count).find(|&i| {
+        type_bits & (1 << i) != 0
+            && props.memory_types[i as usize].property_flags.contains(flags)
+    })
+}
+
 fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     flags: vk::MemoryPropertyFlags,
 ) -> u32 {
-    for i in 0..props.memory_type_count {
-        if type_bits & (1 << i) != 0
-            && props.memory_types[i as usize].property_flags.contains(flags)
-        {
-            return i;
-        }
+    find_memory_type_opt(props, type_bits, flags).expect("no suitable GPU memory type")
+}
+
+/// Allocation that is allowed to fail because the memory type simply
+/// is not there — LAZILY_ALLOCATED exists on tilers and on almost no
+/// desktop GPU, and asking for it must not be fatal.
+fn alloc_memory_opt(
+    device: &ash::Device,
+    props: &vk::PhysicalDeviceMemoryProperties,
+    req: vk::MemoryRequirements,
+    flags: vk::MemoryPropertyFlags,
+) -> Option<vk::DeviceMemory> {
+    let index = find_memory_type_opt(props, req.memory_type_bits, flags)?;
+    unsafe {
+        device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(index),
+                None,
+            )
+            .ok()
     }
-    panic!("no suitable GPU memory type");
 }
 
 fn alloc_memory(
@@ -2357,9 +2778,10 @@ fn create_host_buffer(
 #[cfg(test)]
 mod tests {
     use super::{
-        glass_rank, glass_target, is_glass, parse_cube, pyramid_steps, run_kind, scissor_for,
-        RunKind,
+        clamp_samples, glass_rank, glass_target, is_glass, parse_cube, pyramid_steps, run_kind,
+        samples_to_count, scissor_for, RunKind,
     };
+    use ash::vk;
     use nacelle::draw::{
         ImageId, ADD_ATLAS, BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3,
     };
@@ -2491,6 +2913,41 @@ mod tests {
         // An empty clip (a fully clipped subtree) is zero area too.
         let empty = scissor_for(Some([100.0, 100.0, 0.0, 0.0]), 800, 600);
         assert_eq!((empty[2], empty[3]), (0, 0));
+    }
+
+    /// A multisampling request never exceeds the device and never
+    /// exceeds itself: it walks down to the nearest count the colour
+    /// attachments actually hold, and 1 — always supported — is the
+    /// floor no device can refuse.
+    #[test]
+    fn the_sample_count_never_promises_more_than_the_device_holds() {
+        let all = vk::SampleCountFlags::TYPE_1
+            | vk::SampleCountFlags::TYPE_2
+            | vk::SampleCountFlags::TYPE_4
+            | vk::SampleCountFlags::TYPE_8;
+        for want in [1u32, 2, 4, 8] {
+            assert_eq!(samples_to_count(clamp_samples(want, all)), want);
+        }
+        // A device that stops at 4 gives 4 to a request for 8.
+        let upto4 = vk::SampleCountFlags::TYPE_1
+            | vk::SampleCountFlags::TYPE_2
+            | vk::SampleCountFlags::TYPE_4;
+        assert_eq!(samples_to_count(clamp_samples(8, upto4)), 4);
+        assert_eq!(samples_to_count(clamp_samples(4, upto4)), 4);
+        // A gap in the ladder is stepped over, not through: 4 missing
+        // means a request for 4 lands on 2, never on 8.
+        let gapped = vk::SampleCountFlags::TYPE_1
+            | vk::SampleCountFlags::TYPE_2
+            | vk::SampleCountFlags::TYPE_8;
+        assert_eq!(samples_to_count(clamp_samples(4, gapped)), 2);
+        assert_eq!(samples_to_count(clamp_samples(8, gapped)), 8);
+        // One sample is off, whatever the device offers.
+        assert_eq!(samples_to_count(clamp_samples(1, all)), 1);
+        // And a device offering nothing above one still works.
+        assert_eq!(
+            samples_to_count(clamp_samples(8, vk::SampleCountFlags::TYPE_1)),
+            1
+        );
     }
 
     #[test]
