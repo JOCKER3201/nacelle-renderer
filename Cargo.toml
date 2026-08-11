@@ -1,0 +1,24 @@
+[package]
+name = "nacelle-renderer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "The Vulkan renderer of the nacelle project: two pipelines over one vertex stream (glyph atlas + registered RGBA images), swapchain bit depth up to sixteen, and a 3D grading LUT"
+license = "MIT"
+repository = "https://github.com/JOCKER3201/nacelle-renderer"
+
+[lib]
+name = "nacelle_renderer"
+
+# The toolkit: the draw list this renderer eats (vertices, runs,
+# image handles) and the glyph-atlas dimensions.
+[dependencies]
+libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
+
+# Vulkan, and surfaces from raw window handles.
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+
+# WGSL -> SPIR-V at startup (pure Rust, no external tools).
+naga = { version = "0.19", features = ["wgsl-in", "spv-out"] }
