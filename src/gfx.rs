@@ -8,7 +8,7 @@
 //! under its own scissor.
 
 use ash::vk;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use std::collections::HashMap;
 use std::ffi::CStr;
 
@@ -47,9 +47,105 @@ struct Texture {
     initialized: bool,
 }
 
-pub struct Gfx {
-    _entry: ash::Entry,
+/// Everything Vulkan keeps at the *process* level: the loaded library,
+/// the one instance, and the instance-level surface entry points. One
+/// per process, never one per screen.
+struct Vk {
+    entry: ash::Entry,
     instance: ash::Instance,
+    surface_loader: ash::khr::surface::Instance,
+}
+
+/// The one instance the whole process shares.
+///
+/// WHY this exists at all: every [`Gfx`] used to create its own
+/// `VkInstance`, and multi-monitor means one `Gfx` per screen. Closing
+/// the first screen ran that screen's `Drop`, and the second `Gfx` then
+/// jumped through a zeroed dispatch table — a call through 0x0 inside
+/// libnvidia-glcore.so, reached from `destroy_swapchain`, and a SIGSEGV
+/// on every exit.
+///
+/// WHAT WAS MEASURED, and only this: under gdb, destroying exactly one
+/// `Gfx` and leaking the rest ends the process cleanly; letting a second
+/// one drop crashes. So the fault is in tearing down the SECOND set of
+/// per-screen Vulkan state, not in teardown as such.
+///
+/// WHICH part of that teardown pulls the rug is NOT isolated. Two
+/// candidates, and this static removes both, which is why it was not
+/// worth separating them:
+///   - `destroy_instance` on the first screen taking driver-global
+///     state with it;
+///   - `Entry` itself. In ash 0.38 an `Entry` owns an `Arc<Library>` and
+///     every `Entry::load` is a fresh `dlopen` with its own count, so the
+///     first `Gfx` to drop ran `dlclose` on the driver while the second
+///     was still calling into it. That fits a jump to 0x0 more exactly
+///     than a driver deinit hook does.
+///
+/// Sharing costs nothing: between construction and teardown neither the
+/// entry nor the instance is touched. `surface_loader` and `pdevice` are
+/// read when a swapchain is rebuilt (depth changes, resizes), not per
+/// frame, and both are handles rather than the instance itself.
+///
+/// WHY it is never destroyed, deliberately: Rust does not drop statics
+/// at process exit, and that is precisely the property wanted here. If
+/// the instance died with the last screen, the last screen would again
+/// be pulling the driver out from under any screen still finishing its
+/// own teardown. Leaving it alive means every `destroy_device` and
+/// `destroy_surface` runs against an instance that outlives it. The
+/// memory is handed back by the kernel when the process ends, which is
+/// the only moment the instance would have been freed anyway.
+static VK: std::sync::OnceLock<Vk> = std::sync::OnceLock::new();
+
+/// Loads the library and creates the process's instance on first call,
+/// hands out the same one afterwards.
+///
+/// `display_handle` decides which surface extensions get enabled
+/// (`VK_KHR_xlib_surface` versus `VK_KHR_wayland_surface` and so on),
+/// so the first window to ask settles the list for every later one.
+/// That is sound as long as the process has a single winit event loop
+/// — winit enforces exactly that, so every window in a process reports
+/// the same *kind* of display handle.
+///
+/// # Safety
+/// Calls into the Vulkan loader; `display_handle` must be a live handle
+/// from the window system this process is actually running under.
+unsafe fn shared(display_handle: RawDisplayHandle) -> &'static Vk {
+    // RawDisplayHandle is Copy, so the closure can capture it outright.
+    VK.get_or_init(|| {
+        let entry = ash::Entry::load().expect("cannot load the Vulkan library");
+
+        let app_name = CStr::from_bytes_with_nul(b"nacelle-desktop\0").unwrap();
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(app_name)
+            .engine_name(app_name)
+            .api_version(vk::make_api_version(0, 1, 0, 0));
+
+        let ext_names = ash_window::enumerate_required_extensions(display_handle)
+            .expect("missing surface extensions")
+            .to_vec();
+
+        let instance_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&ext_names);
+        let instance = entry
+            .create_instance(&instance_info, None)
+            .expect("cannot create Vulkan instance");
+
+        let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
+
+        Vk {
+            entry,
+            instance,
+            surface_loader,
+        }
+    })
+}
+
+pub struct Gfx {
+    /// A clone of the process-wide surface loader: a handful of
+    /// function pointers plus the instance handle, nothing owned. It is
+    /// held per `Gfx` because the *surface* below is per window, and
+    /// destroying it in `Drop` needs the loader right here.
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
     pdevice: vk::PhysicalDevice,
@@ -147,46 +243,33 @@ impl Gfx {
         height: u32,
     ) -> Self {
         unsafe {
-            let entry = ash::Entry::load().expect("cannot load the Vulkan library");
-
-            let app_name = CStr::from_bytes_with_nul(b"nacelle-desktop\0").unwrap();
-            let app_info = vk::ApplicationInfo::default()
-                .application_name(app_name)
-                .engine_name(app_name)
-                .api_version(vk::make_api_version(0, 1, 0, 0));
-
             let display_handle = handle.display_handle().unwrap().as_raw();
             let window_handle = handle.window_handle().unwrap().as_raw();
 
-            let ext_names = ash_window::enumerate_required_extensions(display_handle)
-                .expect("missing surface extensions")
-                .to_vec();
-
-            let instance_info = vk::InstanceCreateInfo::default()
-                .application_info(&app_info)
-                .enabled_extension_names(&ext_names);
-            let instance = entry
-                .create_instance(&instance_info, None)
-                .expect("cannot create Vulkan instance");
+            // The library, the instance and the surface loader belong to
+            // the process, not to this screen — see [`VK`] for the crash
+            // that taught us so.
+            let vk = shared(display_handle);
 
             let surface = ash_window::create_surface(
-                &entry,
-                &instance,
+                &vk.entry,
+                &vk.instance,
                 display_handle,
                 window_handle,
                 None,
             )
             .expect("cannot create window surface");
-            let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
+            let surface_loader = vk.surface_loader.clone();
 
             // GPU + queue family selection (graphics + present).
-            let pdevices = instance
+            let pdevices = vk
+                .instance
                 .enumerate_physical_devices()
                 .expect("no Vulkan devices");
             let (pdevice, queue_family) = pdevices
                 .iter()
                 .find_map(|&pd| {
-                    instance
+                    vk.instance
                         .get_physical_device_queue_family_properties(pd)
                         .iter()
                         .enumerate()
@@ -208,11 +291,15 @@ impl Gfx {
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&dev_exts);
-            let device = instance
+            let device = vk
+                .instance
                 .create_device(pdevice, &device_info, None)
                 .expect("cannot create logical device");
             let queue = device.get_device_queue(queue_family, 0);
-            let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
+            // Unlike the surface loader, this one stays per `Gfx`: its
+            // pointers come from `get_device_proc_addr`, so they belong
+            // to this screen's device and to no other.
+            let swapchain_loader = ash::khr::swapchain::Device::new(&vk.instance, &device);
 
             // Surface format: the depth preference decides later, at
             // recreate; the start is the plain eight-bit UNORM path.
@@ -313,7 +400,7 @@ impl Gfx {
                 )
                 .unwrap();
 
-            let mem_props = instance.get_physical_device_memory_properties(pdevice);
+            let mem_props = vk.instance.get_physical_device_memory_properties(pdevice);
 
             // The identity LUT: two voxels an edge, each the colour of
             // its own corner. Present from the first frame so the
@@ -458,8 +545,6 @@ impl Gfx {
                 .unwrap();
 
             let mut gfx = Gfx {
-                _entry: entry,
-                instance,
                 surface_loader,
                 surface,
                 pdevice,
@@ -1758,7 +1843,13 @@ impl Drop for Gfx {
             }
             d.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
-            self.instance.destroy_instance(None);
+            // No `destroy_instance` here, and that is the whole point.
+            // The instance lives in the process-wide [`VK`] static and
+            // is never destroyed, so the two calls above are safe even
+            // when a second screen is still running: the device and the
+            // surface are this screen's alone, while the instance
+            // outlives every `Gfx`. See [`VK`] for why tearing it down
+            // per screen crashed the process.
         }
     }
 }
@@ -2499,6 +2590,17 @@ mod tests {
         let empty = scissor_for(Some([100.0, 100.0, 0.0, 0.0]), 800, 600);
         assert_eq!((empty[2], empty[3]), (0, 0));
     }
+
+    // No unit test guards the shared instance, and one was removed rather
+    // than kept: it asserted `OnceLock<Vk>: Sync`, which the declaration of
+    // `static VK` already requires, so it could not fail on its own and its
+    // comment claimed otherwise. A test that cannot fail is worse than no
+    // test — it reports a proof that was never performed.
+    //
+    // The bug is a SIGSEGV on process exit with two screens open. Catching
+    // it needs two real windows on a real GPU; it was verified by running
+    // `nacelle-desktop --desktop` on a two-monitor desktop, three times,
+    // exit status 0 each time, against the same build that crashed before.
 
     #[test]
     fn a_cube_file_parses_and_a_broken_one_does_not() {
