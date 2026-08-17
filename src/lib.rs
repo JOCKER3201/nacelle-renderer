@@ -16,4 +16,11 @@ mod gfx;
 mod shaders;
 mod timing;
 
+/// What the shaders cost, counted in instructions rather than in
+/// seconds: the same WGSL -> naga -> SPIR-V road the renderer walks at
+/// startup, read back and tallied. Public because the measurement is
+/// meant to be run — `cargo run --example shader_stats` — and because
+/// it answers questions about shaders this crate does not itself carry.
+pub mod spirvstat;
+
 pub use gfx::{parse_cube, Gfx};

@@ -22,3 +22,11 @@ raw-window-handle = "0.6"
 
 # WGSL -> SPIR-V at startup (pure Rust, no external tools).
 naga = { version = "0.19", features = ["wgsl-in", "spv-out"] }
+
+# The SPIR-V header — opcode and GLSL.std.450 names and nothing else
+# (no_std, one dependency, no parser). Already in this tree as naga's
+# own dependency at the same version, so it adds no download; taking it
+# directly is what keeps `spirvstat` from transcribing the opcode table
+# by hand into the file whose whole job is to report exact numbers.
+# License: Apache-2.0 (gfx-rs/rspirv) — on the project's allowed list.
+spirv = "0.3"
