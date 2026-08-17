@@ -14,5 +14,6 @@
 
 mod gfx;
 mod shaders;
+mod timing;
 
 pub use gfx::{parse_cube, Gfx};
