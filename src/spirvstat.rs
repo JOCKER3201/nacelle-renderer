@@ -1006,6 +1006,49 @@ mod tests {
         assert_eq!(cost("fs_shape").own.samples(), 0);
     }
 
+    /// **What K3b's split into functions cost the shape lane, and what
+    /// it did not.** The field's mathematics moved out of `fs_shape`'s
+    /// body into `shape_distance`/`shape_cover`/`over`/`shape_compose`
+    /// so that the frosted entry point could call the same forms
+    /// instead of carrying a second copy of them. That moved a number
+    /// every measurement of this lane is quoted from, and a moved
+    /// number with no note is a number somebody re-reads as a
+    /// regression.
+    ///
+    /// Measured on both sides of the split, with this file's own
+    /// walker: `fs_shape.own.compute()` 78 → 6 and `own.class(Alu)`
+    /// 57 → 5, because the body is now a call; `total.total()`
+    /// 174 → 199, the 25 being OpFunction / OpFunctionParameter /
+    /// OpLabel / OpReturnValue / OpFunctionCall and the locals they
+    /// need. THE WORK IS UNCHANGED TO THE INSTRUCTION, and that is
+    /// what the two assertions below pin: reachable compute and
+    /// reachable ALU are the same numbers as before K3b.
+    ///
+    /// Which is also the lesson for whoever pins the next one: on an
+    /// entry point that calls anything, `own` measures where the code
+    /// was WRITTEN and `total` measures what the fragment DOES. A
+    /// budget belongs on `total`.
+    #[test]
+    fn the_shape_lane_computes_what_it_computed_before_it_was_split_up() {
+        let m = builtin().expect("the renderer's own SPIR-V parses");
+        let shape = m
+            .costs()
+            .into_iter()
+            .find(|c| c.name == "fs_shape")
+            .expect("fs_shape is missing");
+        assert_eq!(shape.total.compute(), 87, "the field's work changed");
+        assert_eq!(shape.total.class(Class::Alu), 63, "the field's ALU changed");
+        // And the body itself is now scaffolding: a handful of loads
+        // and four calls. If this grows, the mathematics came back —
+        // which is the second copy K3b existed to prevent.
+        assert!(shape.own.compute() < 20, "the field moved back into the body");
+        assert_eq!(
+            shape.callees,
+            vec!["grade", "shape_compose", "shape_cover", "shape_distance"],
+            "the plain lane's callees are the shared forms and the grade"
+        );
+    }
+
     /// The road for a foreign source must be the road for ours, or a
     /// measurement of another branch's shader would be a measurement of
     /// different writer options.

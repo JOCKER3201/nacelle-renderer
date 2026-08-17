@@ -1,10 +1,11 @@
 //! WGSL -> SPIR-V compilation at startup using naga (pure Rust,
-//! no external tools like glslc). One module, five entry points: the
+//! no external tools like glslc). One module, six entry points: the
 //! shared vertex stage, the atlas fragment (coverage modulates alpha),
 //! the image fragment (the texture IS the color), the frosted-glass
-//! fragment (the blurred scene, sampled by screen position) and the
+//! fragment (the blurred scene, sampled by screen position), the
 //! shape fragment (the vector core: an analytic distance field read
-//! from the record a vertex points at).
+//! from the record a vertex points at) and, since K3b, the frosted
+//! band of that same core — the one fragment that reads both.
 
 pub const WGSL_SRC: &str = r#"
 struct Push {
@@ -277,6 +278,21 @@ fn fs_shape(
 // under it. The rank it samples is the RUN's — the renderer binds one
 // pyramid target per run, which is why the toolkit has three
 // SHAPE_GLASS handles and the record has no rank field.
+//
+// AND THE GRADE GOES ON THE LAYERS, WHICH IS THE ONE LINE HERE THAT
+// LOOKS LIKE A STYLE CHOICE AND IS NOT. A frosted surface is drawn in
+// two pieces: this band, and a CORE of two ordinary quads — the frost
+// through fs_blur, the wash through fs_main — that the hardware
+// blends. Each of those grades its own colour on the way out, so the
+// core shows grade(wash) over grade(frost). OVER is associative, so
+// this fragment reproduces it exactly by folding the two GRADED
+// layers; folding first and grading the result is a different colour
+// wherever the LUT is not affine, and the difference draws as a
+// rectangle inside the panel, on the line where the core's cut falls.
+// `fs_shape` above may grade its composite and does: its fill is one
+// layer, and there is nothing in it for a fold to reassociate.
+// nacelle::sdf::glass_base carries the identity and the proof; the
+// LUT is off by default, so nothing here would have said otherwise.
 @fragment
 fn fs_shape_glass(
     @builtin(position) pos: vec4<f32>,
@@ -292,10 +308,10 @@ fn fs_shape_glass(
     // surface's own core draws through fs_blur, so core and band frost
     // alike. The tint can only darken; the wash over it is the only
     // layer that can brighten (the master's ladder at elev.*.glass).
-    let frost = textureSample(t_atlas, s_atlas, pos.xy / pc.screen) * s.tint;
+    let frost = grade(textureSample(t_atlas, s_atlas, pos.xy / pc.screen) * s.tint);
     let has_fill = f32((s.flags >> 12u) & 1u);
-    let wash = vec4<f32>(color.rgb, color.a * has_fill);
-    return grade(shape_compose(over(wash, frost), s.stroke_c, cb.x, cb.y));
+    let wash = grade(vec4<f32>(color.rgb, color.a * has_fill));
+    return shape_compose(over(wash, frost), grade(s.stroke_c), cb.x, cb.y);
 }
 "#;
 
@@ -415,8 +431,20 @@ mod tests {
     ///   the tint can only darken and the wash is the only knob that
     ///   brightens, which is precisely the asymmetry of these two
     ///   operators.
-    /// * The three layers reach ONE `shape_compose` call. Two calls,
-    ///   or a second `grade`, would be R4 rebuilt by hand.
+    /// * The three layers reach ONE `shape_compose` call. Two calls
+    ///   would be R4 rebuilt by hand.
+    /// * The grade is applied to each LAYER and never to their fold.
+    ///   The core of the same surface is two ordinary draws the
+    ///   hardware blends after each has graded itself, and OVER is
+    ///   associative — so folding graded layers reproduces the core
+    ///   exactly and grading the fold does not. That one is worth a
+    ///   test of its own because it is INVISIBLE by default: `grade()`
+    ///   is the identity until a user loads a colour LUT, and the day
+    ///   they do, a rectangle appears inside every frosted panel on the
+    ///   line where the core's cut falls. `nacelle::sdf` states the
+    ///   identity and rasterises both variants to prove it; this side
+    ///   can only hold the shape of the expression, which is exactly
+    ///   the thing a refactor would tidy away.
     #[test]
     fn the_frosted_fragment_samples_the_screen_and_lays_the_wash_over_the_tint() {
         let src = super::WGSL_SRC;
@@ -432,7 +460,15 @@ mod tests {
         );
         assert!(glass.contains("let p = uv;"), "the field lost its local point");
         assert_eq!(glass.matches("shape_compose(").count(), 1, "two compositions");
-        assert_eq!(glass.matches("grade(").count(), 1, "graded twice");
+        // Three grades, one per layer, and NONE around the composite.
+        assert_eq!(glass.matches("grade(").count(), 3, "a layer lost its grade");
+        assert!(
+            !glass.contains("grade(shape_compose("),
+            "the grade moved onto the fold: the band no longer matches its own core"
+        );
+        assert!(glass.contains("let frost = grade("), "the frost is graded where it is made");
+        assert!(glass.contains("let wash = grade("), "the wash is graded where it is made");
+        assert!(glass.contains("grade(s.stroke_c)"), "the border stopped being graded at all");
         // The record's fourth colour, in both languages.
         assert!(src.contains("tint: vec4<f32>,"));
         // And OVER is the identity nacelle::sdf::over states, not a mix.
