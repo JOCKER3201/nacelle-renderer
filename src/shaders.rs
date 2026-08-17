@@ -85,6 +85,11 @@ struct Shape {
 // does not parse `const` inside a function body.
 const SQRT1_2: f32 = 0.70710678118654752;
 
+// The six-fold lattice, for the hexagon: the mirror normal
+// (-cos 30, sin 30) that folds a quadrant into one sixth, and 1/sqrt(3),
+// half of one edge in units of the apothem.
+const HK: vec3<f32> = vec3<f32>(-0.8660254, 0.5, 0.5773503);
+
 // The grading LUT, applied last in every fragment path. Identity when
 // pc.lut is zero.
 fn grade(c: vec4<f32>) -> vec4<f32> {
@@ -128,16 +133,20 @@ fn fs_image(
     return grade(textureSample(t_atlas, s_atlas, uv) * color);
 }
 
-// The vector core (f3 2.2/2.3/2.10): every record drawn as its Box
-// distance — round and chamfered corners per corner, bed and border
-// composed by area in ONE record. `uv` carries the LOCAL position in px
-// from the record's centre; the atlas is not sampled here at all.
+// The vector core (f3 2.2/2.3/2.10): one record, one distance field,
+// bed and border composed by area. `uv` carries the LOCAL position in
+// px from the record's centre; the atlas is not sampled here at all.
+//
+// K6 gave bits 8-11 a reader, so the field is chosen by KIND: the box
+// with a treatment per corner, the annular arc, the hexagon, the
+// chevron. Capsule is declared and still drawn as its box, because
+// nothing emits one.
 //
 // nacelle::sdf is the specification this implements, function for
-// function: d_box, d_round, d_chamfer, coverage, band_coverage,
-// compose. A change here that is not also a change there is wrong by
-// definition — that file is where the mathematics is proved, on the
-// CPU, without a device.
+// function: d_box, d_round, d_chamfer, d_hex, d_arc, d_chevron,
+// d_record, coverage, band_coverage, compose. A change here that is not
+// also a change there is wrong by definition — that file is where the
+// mathematics is proved, on the CPU, without a device.
 @fragment
 fn fs_shape(
     @location(0) uv: vec2<f32>,
@@ -181,6 +190,72 @@ fn fs_shape(
     var d = d_box;
     d = select(d, d_rnd, st == 1u);
     d = select(d, d_chm, st == 2u);
+
+    // ---- the kinds past Box (K6, bits 8-11) -------------------------
+    //
+    // Until K6 this fragment drew EVERY record as the box distance
+    // above and never looked at bits 8-11, so a Hex record and a Box
+    // record of the same rect were the same picture. They are not any
+    // more. Each field below is the mirror of a function in
+    // nacelle::sdf — d_hex, d_arc, d_chevron — and the record's
+    // per-kind slots are read exactly as the table on
+    // nacelle::draw::ShapeKind states them: lengths in `corner`, angles
+    // in `arc_half` / `arc_dir`.
+    //
+    // Computed UNCONDITIONALLY and composed by select, like the corner
+    // treatments and for a harder reason: `dpdx`/`dpdy` below must sit
+    // in uniform control flow, and a branch on a record's own kind is
+    // not uniform across a draw. Every fragment therefore pays for
+    // every kind. That is a measured cost for K3c to answer — the
+    // honest remedy is one pipeline per kind, keyed on the run, not a
+    // branch here.
+    let kind = (s.flags >> 8u) & 0xFu;
+
+    // The local point seen from a frame turned by arc_dir: the two
+    // kinds that carry an angle share it, and rotating the question is
+    // the same as rotating the shape.
+    let ca = cos(s.arc_dir);
+    let sa = sin(s.arc_dir);
+    let pt = vec2<f32>(p.x * ca + p.y * sa, -p.x * sa + p.y * ca);
+
+    // Hex: the flat-topped hexagon of apothem corner.x, folded into one
+    // sixth and read against that sixth's single edge.
+    var hp = abs(pt);
+    hp = hp - 2.0 * min(dot(HK.xy, hp), 0.0) * HK.xy;
+    hp = hp - vec2<f32>(clamp(hp.x, -HK.z * s.corner.x, HK.z * s.corner.x), s.corner.x);
+    // sign(0.0) is zero in WGSL and one in Rust, so the sign is a
+    // comparison in both files rather than a call in either.
+    let d_hexagon = length(hp) * select(-1.0, 1.0, hp.y >= 0.0);
+
+    // Ring: the annular arc, half width corner.x, its outer edge on the
+    // shorter side of the rect, swept 2*arc_half about local +y with
+    // round caps. Clamping sin at zero is what makes arc_half >= PI a
+    // CLOSED ring: a non-positive left side can never beat zero, so
+    // every fragment takes the circle (sin(PI) in f32 is a hair below
+    // zero, and that hair used to decide it).
+    let rb = s.corner.x;
+    let ra = max(min(b.x, b.y) - rb, 0.0);
+    let sn = max(sin(s.arc_half), 0.0);
+    let cs = cos(s.arc_half);
+    let ap = vec2<f32>(abs(pt.x), pt.y);
+    let d_cap = length(ap - vec2<f32>(sn, cs) * ra) - rb;
+    let d_ann = abs(length(ap) - ra) - rb;
+    let d_ring = select(d_ann, d_cap, cs * ap.x > sn * ap.y);
+
+    // Chevron: the box with one or both vertical ends collapsed to a
+    // point at mid-height, corner.x deep on the left and corner.y on
+    // the right. abs(p.y) folds each end's two slanted edges into one
+    // half-plane; a depth of zero gives back that end's own vertical
+    // edge exactly, so an uncollapsed end needs no second formula.
+    let ll = max(sqrt(b.y * b.y + s.corner.x * s.corner.x), 1e-6);
+    let lr = max(sqrt(b.y * b.y + s.corner.y * s.corner.y), 1e-6);
+    let cut_l = (s.corner.x * abs(p.y) - b.y * (p.x + b.x)) / ll;
+    let cut_r = (s.corner.y * abs(p.y) - b.y * (b.x - p.x)) / lr;
+    let d_chevron = max(d_box, max(cut_l, cut_r));
+
+    d = select(d, d_ring, kind == 1u);
+    d = select(d, d_hexagon, kind == 2u);
+    d = select(d, d_chevron, kind == 3u);
 
     // AA width from the SCREEN derivatives of the field itself — the
     // one form correct under any transform the vertices rode through.
@@ -304,6 +379,57 @@ mod tests {
         assert!(src.contains("let s_a = a_band * s.stroke_c.a;"));
         assert!(src.contains("let has_fill = f32((s.flags >> 12u) & 1u);"));
         assert!(src.contains("let has_stroke = f32((s.flags >> 13u) & 1u);"));
+    }
+
+    /// K6's own regression: bits 8-11 must still be READ.
+    ///
+    /// The trap this holds shut is the one f3 §4 named before K6 was
+    /// written — "fs_shape draws every record as its box distance and
+    /// never reads bits 8-11", so a Hex record and a Box record of the
+    /// same rect drew the same picture and nothing complained. Every
+    /// kind the toolkit can now emit has to have a field here and be
+    /// selected on the kind, and the selection has to stay a `select`:
+    /// `dpdx` further down must sit in uniform control flow, and a
+    /// branch on a per-record value is not uniform.
+    ///
+    /// The arithmetic itself is proved on the CPU in `nacelle::sdf`.
+    /// What this side can hold is that the branch exists, that it reads
+    /// the record's own slots, and that the retired assumption has not
+    /// crept back.
+    #[test]
+    fn the_shape_fragment_chooses_its_field_by_kind() {
+        let shape = super::WGSL_SRC
+            .split("fn fs_shape(")
+            .nth(1)
+            .expect("fs_shape went missing");
+        let code: String = shape
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("let kind = (s.flags >> 8u) & 0xFu;"),
+            "the kind stopped being read out of bits 8-11"
+        );
+        for (want, what) in [
+            ("d = select(d, d_ring, kind == 1u);", "Ring"),
+            ("d = select(d, d_hexagon, kind == 2u);", "Hex"),
+            ("d = select(d, d_chevron, kind == 3u);", "Chevron"),
+        ] {
+            assert!(code.contains(want), "{what} lost its branch: the box would draw instead");
+        }
+        // The per-kind slots, read where the record puts them.
+        assert!(code.contains("s.arc_half"), "the sweep went unread");
+        assert!(code.contains("s.arc_dir"), "the turn went unread");
+        // A closed ring must not fall to the cap branch on the float
+        // noise of sin(PI); the clamp is what stops it.
+        assert!(
+            code.contains("let sn = max(sin(s.arc_half), 0.0);"),
+            "a full ring will grow caps again"
+        );
+        // No `if` may wrap the fields: the derivatives below are taken
+        // in whatever control flow this leaves them in.
+        assert!(!code.contains("if ("), "a branch on the kind broke derivative uniformity");
     }
 
     /// **Why f3 K4 cost this crate nothing.** The diagonal lane — every
