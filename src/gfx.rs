@@ -16,12 +16,25 @@ use std::ffi::CStr;
 use nacelle::draw::{DrawRun, ImageId, Shape, Vertex, NO_SHAPE};
 use nacelle::font::{ATLAS_H, ATLAS_W};
 
+use crate::timing::{
+    GpuTiming, SLOT_BASE_END, SLOT_FRAME_END, SLOT_MAIN_START, SLOT_PYRAMID_END, SLOT_UPLOADS_END,
+};
+
 const MAX_VERTS: usize = 400_000;
 /// Shape records per frame: 16 384 × 64 B = 1 MB, host-visible and
 /// persistently mapped like the vertex buffer. Overflow degrades the
 /// MAX_VERTS way — records past the limit are clipped, the frame is
 /// never lost (f3 2.5, R5).
 const MAX_SHAPES: usize = 16_384;
+
+/// How many frames the CPU may be ahead of the GPU: one command
+/// buffer, one fence, one semaphore pair, and [`Gfx::render`] waits on
+/// that fence before it touches any of them. Timing reads its
+/// timestamps exactly this many frames late — see [`crate::timing`]
+/// for why this number, and not the swapchain's image count, is the
+/// one that matters. Grow the buffers and this constant grows with
+/// them.
+const FRAMES_IN_FLIGHT: u32 = 1;
 
 /// One target of the frosted-glass chain: the base scene at full size,
 /// then the shrinking pyramid whose repeated linear resampling IS the
@@ -251,6 +264,11 @@ pub struct Gfx {
     sem_render: vk::Semaphore,
     fence: vk::Fence,
     needs_recreate: bool,
+    /// GPU timestamps, per pass, when `NACELLE_GPU_TIMING` asks for
+    /// them. `None` — the default — is not a disabled instrument but
+    /// no instrument at all: no query pool, no windows, no branch that
+    /// costs more than reading this field.
+    timing: Option<GpuTiming>,
 }
 
 impl Gfx {
@@ -620,6 +638,29 @@ impl Gfx {
                 )
                 .unwrap();
 
+            // GPU timing, only if asked for. Two device facts decide
+            // whether it can work at all: the length of a tick
+            // (`timestampPeriod`, nanoseconds) and how many bits of a
+            // timestamp this queue family actually fills
+            // (`timestampValidBits`). The family is asked rather than
+            // the device-wide `timestampComputeAndGraphics`, because
+            // the family's answer is the exact one for the queue the
+            // frames go to; the device-wide promise is only reported.
+            let limits = vk.instance.get_physical_device_properties(pdevice).limits;
+            let valid_bits = vk
+                .instance
+                .get_physical_device_queue_family_properties(pdevice)
+                .get(queue_family as usize)
+                .map(|q| q.timestamp_valid_bits)
+                .unwrap_or(0);
+            let timing = GpuTiming::from_env(
+                &device,
+                limits.timestamp_period,
+                valid_bits,
+                limits.timestamp_compute_and_graphics == vk::TRUE,
+                FRAMES_IN_FLIGHT,
+            );
+
             let mut gfx = Gfx {
                 surface_loader,
                 surface,
@@ -685,6 +726,7 @@ impl Gfx {
                 sem_render,
                 fence,
                 needs_recreate: false,
+                timing,
             };
             gfx.recreate_swapchain(width, height);
             gfx
@@ -1016,6 +1058,16 @@ impl Gfx {
                 self.device.free_memory(mem, None);
             }
 
+            // The same fence is what makes the previous frame's
+            // timestamps readable, and this is the one moment they are
+            // both complete and not yet reset. Reading never waits on
+            // the GPU: a query that is somehow not published costs one
+            // sample and nothing else.
+            let (tw, th) = (self.extent.width, self.extent.height);
+            if let Some(t) = self.timing.as_mut() {
+                t.collect(&self.device, tw, th);
+            }
+
             let acquired = self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
@@ -1122,6 +1174,16 @@ impl Gfx {
                 )
                 .unwrap();
 
+            // Opens the frame's timestamps. It has to be here: after
+            // the command buffer is recording (the pool reset is a
+            // command) and before any render pass (a reset may not be
+            // inside one). `blur_base` already knows whether this
+            // frame has glass, which is what decides how many of the
+            // six timestamps it will write.
+            if let Some(t) = self.timing.as_mut() {
+                t.begin_frame(&self.device, cmd, blur_base.is_some());
+            }
+
             if upload_atlas {
                 // Before the first full upload the staging buffer may hold
                 // only a fragment; initialisation always copies everything.
@@ -1135,6 +1197,7 @@ impl Gfx {
             }
             self.record_texture_uploads(cmd);
             self.record_lut_upload(cmd);
+            self.gpu_mark(cmd, SLOT_UPLOADS_END);
 
             // Bindings that hold for every pass this frame.
             self.device
@@ -1156,6 +1219,7 @@ impl Gfx {
                 self.begin_blur_pass(cmd, t0.0, t0.1, t0.2, clear);
                 self.record_runs(cmd, 0, base, runs, (t0.1, t0.2), false);
                 self.device.cmd_end_render_pass(cmd);
+                self.gpu_mark(cmd, SLOT_BASE_END);
                 // Down the pyramid: each level is the previous one
                 // resampled linearly, and the shrinking IS the blur —
                 // then back up (and, at full depth, down once more) so
@@ -1185,6 +1249,7 @@ impl Gfx {
                     self.device.cmd_draw(cmd, 6, 1, aux, 0);
                     self.device.cmd_end_render_pass(cmd);
                 }
+                self.gpu_mark(cmd, SLOT_PYRAMID_END);
             }
 
             let clear_values = [vk::ClearValue {
@@ -1236,6 +1301,11 @@ impl Gfx {
                         &[],
                     );
                     self.device.cmd_draw(cmd, 6, 1, aux, 0);
+                    // The composite ends here and the main pass
+                    // begins; a timestamp inside a render pass is
+                    // legal, and it is the only place the boundary
+                    // exists, because both live in the same pass.
+                    self.gpu_mark(cmd, SLOT_MAIN_START);
                     // Everything above the glass, glass included.
                     self.push_pc(
                         cmd,
@@ -1253,6 +1323,11 @@ impl Gfx {
                     );
                 }
                 None => {
+                    // No glass, so no composite: the main pass starts
+                    // with the runs themselves. What the swapchain
+                    // pass spent getting here shows up as the
+                    // report's leftover, not inside a named span.
+                    self.gpu_mark(cmd, SLOT_MAIN_START);
                     self.push_pc(
                         cmd,
                         self.extent.width as f32,
@@ -1270,6 +1345,7 @@ impl Gfx {
                 }
             }
             self.device.cmd_end_render_pass(cmd);
+            self.gpu_mark(cmd, SLOT_FRAME_END);
             self.device.end_command_buffer(cmd).unwrap();
 
             let wait_sems = [self.sem_image];
@@ -1284,6 +1360,12 @@ impl Gfx {
             self.device
                 .queue_submit(self.queue, &[submit], self.fence)
                 .unwrap();
+            // The queries are in flight from here; the frame counter
+            // moves on and the read of this frame is due once the
+            // fence has been waited on.
+            if let Some(t) = self.timing.as_mut() {
+                t.end_frame();
+            }
 
             let swapchains = [self.swapchain];
             let indices = [image_index];
@@ -1300,6 +1382,17 @@ impl Gfx {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.needs_recreate = true,
                 Err(e) => panic!("queue_present: {e:?}"),
             }
+        }
+    }
+
+    /// One of the frame's timestamps, if anyone asked for timing. The
+    /// whole per-site cost when nobody did is this `Option` check —
+    /// which is why the recording sites can sit in the frame path
+    /// without a feature flag around each of them.
+    #[inline]
+    unsafe fn gpu_mark(&self, cmd: vk::CommandBuffer, slot: usize) {
+        if let Some(t) = self.timing.as_ref() {
+            t.mark(&self.device, cmd, slot);
         }
     }
 
@@ -1918,6 +2011,12 @@ impl Drop for Gfx {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // The last word before the pool goes: a run too short to
+            // reach a report still prints one.
+            if let Some(t) = self.timing.take() {
+                t.report_final(self.extent.width, self.extent.height);
+                t.destroy(&self.device);
+            }
             let d = &self.device;
             d.destroy_fence(self.fence, None);
             d.destroy_semaphore(self.sem_image, None);
