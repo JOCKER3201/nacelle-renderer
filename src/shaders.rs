@@ -290,5 +290,19 @@ mod tests {
         assert!(src.contains("let a_band = max(cov - cov_in, 0.0) * has_stroke;"));
         assert!(src.contains("let alpha = cov * f_a + s_a * (1.0 - f_a);"));
         assert!(src.contains("let g = vec2<f32>(dpdx(d), dpdy(d));"));
+        // The two gates the composition stands on. `has_fill` is the
+        // one that reads like noise and is not: a STROKE-only record
+        // carries the BAND's colour on its vertices (draw.rs, "the
+        // stroke's when there is no fill"), so dropping the factor
+        // fills every borderless ring solid in its own border colour —
+        // a focus ring becomes a plate. It compiles, it validates, and
+        // nothing else in this file would notice.
+        assert!(
+            src.contains("let f_a = color.a * has_fill;"),
+            "the fill gate went missing: a stroke-only record would fill solid"
+        );
+        assert!(src.contains("let s_a = a_band * s.stroke_c.a;"));
+        assert!(src.contains("let has_fill = f32((s.flags >> 12u) & 1u);"));
+        assert!(src.contains("let has_stroke = f32((s.flags >> 13u) & 1u);"));
     }
 }
