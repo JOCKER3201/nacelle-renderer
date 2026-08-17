@@ -1,21 +1,27 @@
-//! Vulkan renderer (ash) — four pipelines over one vertex stream: the
+//! Vulkan renderer (ash) — five pipelines over one vertex stream: the
 //! atlas one (text and solid shapes, R8 coverage), the image one
 //! (application-registered RGBA textures), the frosted-glass one (the
 //! scene beneath, pre-rendered and blurred, sampled at one of three
-//! pyramid ranks) and the additive one (fs_main again under
-//! SRC_ALPHA/ONE, so glow adds light instead of filming over it). The
-//! draw list's runs say which is which, in emission order, each run
-//! under its own scissor.
+//! pyramid ranks), the additive one (fs_main again under
+//! SRC_ALPHA/ONE, so glow adds light instead of filming over it) and
+//! the shape one (the vector core: an analytic distance field over
+//! set 2's records, one quad per silhouette). The draw list's runs say
+//! which is which, in emission order, each run under its own scissor.
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use std::collections::HashMap;
 use std::ffi::CStr;
 
-use nacelle::draw::{DrawRun, ImageId, Vertex};
+use nacelle::draw::{DrawRun, ImageId, Shape, Vertex, NO_SHAPE};
 use nacelle::font::{ATLAS_H, ATLAS_W};
 
 const MAX_VERTS: usize = 400_000;
+/// Shape records per frame: 16 384 × 64 B = 1 MB, host-visible and
+/// persistently mapped like the vertex buffer. Overflow degrades the
+/// MAX_VERTS way — records past the limit are clipped, the frame is
+/// never lost (f3 2.5, R5).
+const MAX_SHAPES: usize = 16_384;
 
 /// One target of the frosted-glass chain: the base scene at full size,
 /// then the shrinking pyramid whose repeated linear resampling IS the
@@ -167,6 +173,10 @@ pub struct Gfx {
     /// ADD_ATLAS compose with light. Destination alpha stays untouched,
     /// which is what a passthrough swapchain will need (r1 R1/R8).
     pipeline_add: vk::Pipeline,
+    /// fs_shape, normal blend: the vector core's lane. Dead code by
+    /// intent until libnacelle's `render.vector` arms the SHAPE runs —
+    /// nothing in the shipped picture emits them (f3 K1).
+    pipeline_shape: vk::Pipeline,
     /// Offscreen pass for the frosted-glass chain: same format as the
     /// swapchain (which is what lets the ordinary pipelines draw into
     /// it), ending in a shader-readable layout.
@@ -225,6 +235,16 @@ pub struct Gfx {
     vertex_buf: vk::Buffer,
     vertex_mem: vk::DeviceMemory,
     vertex_ptr: *mut u8,
+    /// Set 2: the frame's shape records as one storage buffer. Its own
+    /// layout and its own little pool — set 0 is repinned per run and
+    /// the texture pool frees sets one by one; the shape set is one,
+    /// written once, bound per pass (f3 D4).
+    shapes_layout: vk::DescriptorSetLayout,
+    shapes_pool: vk::DescriptorPool,
+    shapes_set: vk::DescriptorSet,
+    shapes_buf: vk::Buffer,
+    shapes_mem: vk::DeviceMemory,
+    shapes_ptr: *mut u8,
     cmd_pool: vk::CommandPool,
     cmd_buf: vk::CommandBuffer,
     sem_image: vk::Semaphore,
@@ -378,7 +398,44 @@ impl Gfx {
                 )
                 .unwrap();
 
-            let pipes = create_pipeline(&device, render_pass, desc_layout, lut_layout);
+            // Set 2: the shape records (f3 D4). Set 0 is repinned per
+            // run — a texture and a pyramid target each own a set — so
+            // the one frame-wide storage buffer gets its own group, its
+            // own layout and its own one-set pool; the existing pools
+            // hold only SAMPLED_IMAGE and SAMPLER counts (R5).
+            let shapes_bindings = [vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+            let shapes_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&shapes_bindings),
+                    None,
+                )
+                .unwrap();
+            let shapes_pool_sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)];
+            let shapes_pool = device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .max_sets(1)
+                        .pool_sizes(&shapes_pool_sizes),
+                    None,
+                )
+                .unwrap();
+            let shapes_layouts = [shapes_layout];
+            let shapes_set = device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(shapes_pool)
+                        .set_layouts(&shapes_layouts),
+                )
+                .unwrap()[0];
+
+            let pipes =
+                create_pipeline(&device, render_pass, desc_layout, lut_layout, shapes_layout);
 
             // Room for the application's images: browser frames,
             // previews, a wallpaper. Freed individually as images go.
@@ -514,6 +571,25 @@ impl Gfx {
                 vk::BufferUsageFlags::VERTEX_BUFFER,
             );
 
+            // Shape records: the same persistent mapping, written each
+            // frame beside the vertices, read by fs_shape through set 2.
+            let (shapes_buf, shapes_mem, shapes_ptr) = create_host_buffer(
+                &device,
+                &mem_props,
+                (MAX_SHAPES * std::mem::size_of::<Shape>()) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            );
+            let shapes_buf_info = [vk::DescriptorBufferInfo::default()
+                .buffer(shapes_buf)
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let shapes_write = [vk::WriteDescriptorSet::default()
+                .dst_set(shapes_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&shapes_buf_info)];
+            device.update_descriptor_sets(&shapes_write, &[]);
+
             let cmd_pool = device
                 .create_command_pool(
                     &vk::CommandPoolCreateInfo::default()
@@ -563,6 +639,7 @@ impl Gfx {
                 pipeline_image: pipes.image,
                 pipeline_blur: pipes.blur,
                 pipeline_add: pipes.add,
+                pipeline_shape: pipes.shape,
                 blur_pass,
                 blur_targets: Vec::new(),
                 blur_depth: 3,
@@ -596,6 +673,12 @@ impl Gfx {
                 vertex_buf,
                 vertex_mem,
                 vertex_ptr,
+                shapes_layout,
+                shapes_pool,
+                shapes_set,
+                shapes_buf,
+                shapes_mem,
+                shapes_ptr,
                 cmd_pool,
                 cmd_buf,
                 sem_image,
@@ -681,6 +764,7 @@ impl Gfx {
                     self.device.destroy_pipeline(self.pipeline_image, None);
                     self.device.destroy_pipeline(self.pipeline_blur, None);
                     self.device.destroy_pipeline(self.pipeline_add, None);
+                    self.device.destroy_pipeline(self.pipeline_shape, None);
                     self.device
                         .destroy_pipeline_layout(self.pipeline_layout, None);
                     self.device.destroy_render_pass(self.render_pass, None);
@@ -694,12 +778,14 @@ impl Gfx {
                         self.render_pass,
                         self.desc_layout,
                         self.lut_layout,
+                        self.shapes_layout,
                     );
                     self.pipeline_layout = pipes.layout;
                     self.pipeline = pipes.atlas;
                     self.pipeline_image = pipes.image;
                     self.pipeline_blur = pipes.blur;
                     self.pipeline_add = pipes.add;
+                    self.pipeline_shape = pipes.shape;
                 }
             }
 
@@ -885,13 +971,17 @@ impl Gfx {
 
     /// Renders a frame into a surface currently `width` x `height`
     /// pixels. Pass `atlas` only when the atlas has changed. `runs`
-    /// partitions `verts` by texture; empty means all atlas.
+    /// partitions `verts` by texture; empty means all atlas. `shapes`
+    /// is the frame's shape records — what a run tagged SHAPE indexes
+    /// through each vertex's `shape`; empty when the vector lane is
+    /// dark, which is the shipping default.
     pub fn render(
         &mut self,
         width: u32,
         height: u32,
         verts: &[Vertex],
         runs: &[DrawRun],
+        shapes: &[Shape],
         atlas: Option<(&[u8], u32, u32)>,
         clear: [f32; 4],
     ) {
@@ -953,6 +1043,17 @@ impl Gfx {
                 n * std::mem::size_of::<Vertex>(),
             );
 
+            // And the shape records beside them — same mapping, same
+            // overflow rule as MAX_VERTS: clip, never lose the frame.
+            // fs_shape clamps its index, so a vertex pointing past the
+            // clip reads the last record instead of out of bounds.
+            let m = shapes.len().min(MAX_SHAPES);
+            std::ptr::copy_nonoverlapping(
+                shapes.as_ptr() as *const u8,
+                self.shapes_ptr,
+                m * std::mem::size_of::<Shape>(),
+            );
+
             // Frosted glass: everything before the first glass run —
             // any rank, the legacy BLUR_IMAGE included — is the BASE
             // SCENE: rendered offscreen, shrunk down the pyramid (which
@@ -987,7 +1088,7 @@ impl Gfx {
                 ];
                 let quad: Vec<Vertex> = corners
                     .iter()
-                    .map(|&(pos, uv)| Vertex { pos, uv, color: [1.0; 4] })
+                    .map(|&(pos, uv)| Vertex { pos, uv, color: [1.0; 4], shape: NO_SHAPE })
                     .collect();
                 std::ptr::copy_nonoverlapping(
                     quad.as_ptr() as *const u8,
@@ -1203,13 +1304,25 @@ impl Gfx {
     }
 
     unsafe fn push_pc(&self, cmd: vk::CommandBuffer, w: f32, h: f32, lut: f32) {
-        let push = [w, h, lut, self.text_gamma];
+        // 64 bytes (D0): screen/lut/text_gamma in the first 16, then the
+        // homography's three columns at a 16-byte stride — WGSL lays a
+        // mat3x3 out as three vec3s each padded to 16. Identity today:
+        // the cube still projects on the CPU, and identity is proven
+        // bit-for-bit neutral (p.z == 1.0, the manual divide is by 1.0).
+        let mut push = [0.0f32; 16];
+        push[0] = w;
+        push[1] = h;
+        push[2] = lut;
+        push[3] = self.text_gamma;
+        push[4] = 1.0; // column 0 . x
+        push[9] = 1.0; // column 1 . y
+        push[14] = 1.0; // column 2 . z
         self.device.cmd_push_constants(
             cmd,
             self.pipeline_layout,
             vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             0,
-            std::slice::from_raw_parts(push.as_ptr() as *const u8, 16),
+            std::slice::from_raw_parts(push.as_ptr() as *const u8, 64),
         );
     }
 
@@ -1276,6 +1389,17 @@ impl Gfx {
             return;
         }
         let (tw, th) = target;
+        // Set 2 — the frame's shape records — holds for the whole pass:
+        // one set, written once, bound here rather than per run. Only
+        // fs_shape reads it, but binding is state, not work.
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline_layout,
+            2,
+            &[self.shapes_set],
+            &[],
+        );
         // The pass has just set the full-target scissor, so that is
         // what `cur` starts as and what a clipless run restores.
         let mut cur = scissor_for(None, tw, th);
@@ -1298,6 +1422,10 @@ impl Gfx {
                 let (pipeline, set) = match kind {
                     RunKind::Atlas => (self.pipeline, self.desc_set),
                     RunKind::Add => (self.pipeline_add, self.desc_set),
+                    // fs_shape samples nothing from set 0, but the
+                    // shared layout demands one bound; the atlas set is
+                    // always alive.
+                    RunKind::Shape => (self.pipeline_shape, self.desc_set),
                     RunKind::Glass(t) => {
                         if !glass_live {
                             // No blurred scene this frame: the glass
@@ -1797,6 +1925,10 @@ impl Drop for Gfx {
             d.destroy_command_pool(self.cmd_pool, None);
             d.destroy_buffer(self.vertex_buf, None);
             d.free_memory(self.vertex_mem, None);
+            d.destroy_buffer(self.shapes_buf, None);
+            d.free_memory(self.shapes_mem, None);
+            d.destroy_descriptor_pool(self.shapes_pool, None);
+            d.destroy_descriptor_set_layout(self.shapes_layout, None);
             d.destroy_buffer(self.staging_buf, None);
             d.free_memory(self.staging_mem, None);
             d.destroy_sampler(self.sampler, None);
@@ -1825,6 +1957,7 @@ impl Drop for Gfx {
             d.destroy_render_pass(self.blur_pass, None);
             d.destroy_pipeline(self.pipeline_blur, None);
             d.destroy_pipeline(self.pipeline_add, None);
+            d.destroy_pipeline(self.pipeline_shape, None);
             d.destroy_descriptor_pool(self.tex_pool, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
             d.destroy_descriptor_set_layout(self.desc_layout, None);
@@ -1928,6 +2061,8 @@ enum RunKind {
     Atlas,
     /// The atlas under the additive pipeline.
     Add,
+    /// The vector core: fs_shape over the set-2 records.
+    Shape,
     /// Glass, resolved to a pyramid target index.
     Glass(usize),
     Image(u32),
@@ -1937,6 +2072,7 @@ fn run_kind(image: Option<ImageId>, blur_depth: u32) -> RunKind {
     match image {
         None => RunKind::Atlas,
         Some(id) if id == nacelle::draw::ADD_ATLAS => RunKind::Add,
+        Some(id) if id == nacelle::draw::SHAPE => RunKind::Shape,
         Some(id) if is_glass(id) => RunKind::Glass(glass_target(glass_rank(id), blur_depth)),
         Some(id) => RunKind::Image(id.0),
     }
@@ -2067,6 +2203,10 @@ struct Pipelines {
     /// light; ZERO/ONE on alpha so destination alpha stays untouched,
     /// which matters under a passthrough swapchain (r1 R1).
     add: vk::Pipeline,
+    /// fs_shape, straight alpha: the vector core over the set-2
+    /// records. Same blend as the atlas — a shape covers, glow's
+    /// additive lane is K3's.
+    shape: vk::Pipeline,
 }
 
 fn create_pipeline(
@@ -2074,9 +2214,10 @@ fn create_pipeline(
     render_pass: vk::RenderPass,
     desc_layout: vk::DescriptorSetLayout,
     lut_layout: vk::DescriptorSetLayout,
+    shapes_layout: vk::DescriptorSetLayout,
 ) -> Pipelines {
     unsafe {
-        // One SPIR-V module, one vertex stage, three fragment entry
+        // One SPIR-V module, one vertex stage, four fragment entry
         // points; the additive pipeline reuses fs_main and differs only
         // in blend state.
         let spv = crate::shaders::compile();
@@ -2088,6 +2229,7 @@ fn create_pipeline(
         let fs_entry = CStr::from_bytes_with_nul(b"fs_main\0").unwrap();
         let fs_image_entry = CStr::from_bytes_with_nul(b"fs_image\0").unwrap();
         let fs_blur_entry = CStr::from_bytes_with_nul(b"fs_blur\0").unwrap();
+        let fs_shape_entry = CStr::from_bytes_with_nul(b"fs_shape\0").unwrap();
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -2118,6 +2260,16 @@ fn create_pipeline(
                 .module(shader_mod)
                 .name(fs_blur_entry),
         ];
+        let stages_shape = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(shader_mod)
+                .name(vs_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(shader_mod)
+                .name(fs_shape_entry),
+        ];
 
         let bindings = [vk::VertexInputBindingDescription::default()
             .binding(0)
@@ -2139,6 +2291,13 @@ fn create_pipeline(
                 .binding(0)
                 .format(vk::Format::R32G32B32A32_SFLOAT)
                 .offset(16),
+            // The shape-record index (f3 D3). The stride above grows by
+            // itself: it is size_of::<Vertex>().
+            vk::VertexInputAttributeDescription::default()
+                .location(3)
+                .binding(0)
+                .format(vk::Format::R32_UINT)
+                .offset(32),
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
             .vertex_binding_descriptions(&bindings)
@@ -2182,11 +2341,14 @@ fn create_pipeline(
         let dynamic =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
+        // 64 B (D0): 16 of scalars plus the mat3x3's three padded
+        // columns — half the 128 B Vulkan guarantees, hairline_floor
+        // and friends still have room.
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
-            .size(16)];
-        let set_layouts = [desc_layout, lut_layout];
+            .size(64)];
+        let set_layouts = [desc_layout, lut_layout, shapes_layout];
         let layout = device
             .create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -2244,10 +2406,22 @@ fn create_pipeline(
             .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
+        let info_shape = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages_shape)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
         let pipelines = device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
-                &[info, info_image, info_blur, info_add],
+                &[info, info_image, info_blur, info_add, info_shape],
                 None,
             )
             .expect("cannot create pipelines");
@@ -2259,6 +2433,7 @@ fn create_pipeline(
             image: pipelines[1],
             blur: pipelines[2],
             add: pipelines[3],
+            shape: pipelines[4],
         }
     }
 }
@@ -2459,7 +2634,7 @@ mod tests {
         RunKind,
     };
     use nacelle::draw::{
-        ImageId, ADD_ATLAS, BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3,
+        ImageId, ADD_ATLAS, BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3, SHAPE,
     };
 
     /// The base-scene split triggers on glass and only on glass: the
@@ -2471,6 +2646,7 @@ mod tests {
             assert!(is_glass(id), "{id:?} must count as glass");
         }
         assert!(!is_glass(ADD_ATLAS));
+        assert!(!is_glass(SHAPE), "the vector lane covers, it is not glass");
         assert!(!is_glass(ImageId(u32::MAX - 9)));
         assert!(!is_glass(ImageId(0)));
         assert!(!is_glass(ImageId(7)));
@@ -2545,6 +2721,8 @@ mod tests {
     fn runs_bind_by_kind() {
         assert_eq!(run_kind(None, 3), RunKind::Atlas);
         assert_eq!(run_kind(Some(ADD_ATLAS), 3), RunKind::Add);
+        assert_eq!(run_kind(Some(SHAPE), 3), RunKind::Shape);
+        assert_eq!(run_kind(Some(SHAPE), 1), RunKind::Shape);
         assert_eq!(run_kind(Some(BLUR_IMAGE), 3), RunKind::Glass(2));
         assert_eq!(run_kind(Some(BLUR_IMAGE), 1), RunKind::Glass(1));
         assert_eq!(run_kind(Some(GLASS_RANK_1), 3), RunKind::Glass(1));
