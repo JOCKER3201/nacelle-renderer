@@ -66,8 +66,10 @@ fn vs_main(
 @group(1) @binding(1) var s_lut: sampler;
 
 // One shape record, the mirror of nacelle::draw::Shape (f3 2.5):
-// 64 bytes, array stride 64. `half` is a reserved WGSL word, hence
-// half_size.
+// 80 bytes, array stride 80. `half` is a reserved WGSL word, hence
+// half_size. The last field arrived with K3b (3.3): a frosted band
+// composes three colours in one fragment and only two of them had a
+// home — the tint that multiplies the blurred scene had none.
 struct Shape {
     half_size: vec2<f32>,
     stroke: f32,
@@ -78,6 +80,7 @@ struct Shape {
     arc_half: f32,
     arc_dir: f32,
     pad: f32,
+    tint: vec4<f32>,
 };
 @group(2) @binding(0) var<storage, read> shapes: array<Shape>;
 
@@ -134,21 +137,22 @@ fn fs_image(
 // from the record's centre; the atlas is not sampled here at all.
 //
 // nacelle::sdf is the specification this implements, function for
-// function: d_box, d_round, d_chamfer, coverage, band_coverage,
+// function: d_box, d_round, d_chamfer, coverage, band_coverage, over,
 // compose. A change here that is not also a change there is wrong by
 // definition — that file is where the mathematics is proved, on the
 // CPU, without a device.
-@fragment
-fn fs_shape(
-    @location(0) uv: vec2<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) @interpolate(flat) shape: u32,
-) -> @location(0) vec4<f32> {
-    // Overflowing shapes are clipped by the uploader (the MAX_SHAPES
-    // idiom); a vertex past the clip must read SOME record rather than
-    // out of bounds.
-    let s = shapes[min(shape, arrayLength(&shapes) - 1u)];
-    let p = uv;
+//
+// The three functions below carry the whole of it, and they are
+// functions rather than a body because K3b gave the lane a SECOND entry
+// point (fs_shape_glass). Two copies of one field would be two answers
+// waiting to differ, which is exactly the defect this project spent a
+// milestone removing from its easing resolvers.
+
+// The Box family's distance under four per-corner treatments — the
+// mirror of nacelle::sdf::d_shape. No derivatives here: this is a pure
+// function of the local point, and that is what lets the caller take
+// its screen gradient.
+fn shape_distance(s: Shape, p: vec2<f32>) -> f32 {
     let b = s.half_size;
 
     // The exact box distance.
@@ -181,7 +185,13 @@ fn fs_shape(
     var d = d_box;
     d = select(d, d_rnd, st == 1u);
     d = select(d, d_chm, st == 2u);
+    return d;
+}
 
+// Coverage of the silhouette (x) and area of the inward band (y).
+// Called from the top level of an entry point and from nowhere else:
+// the derivatives below need uniform control flow.
+fn shape_cover(s: Shape, d: f32) -> vec2<f32> {
     // AA width from the SCREEN derivatives of the field itself — the
     // one form correct under any transform the vertices rode through.
     // length(vec2(dpdx, dpdy)), never fwidth: fwidth over-reads by
@@ -197,25 +207,95 @@ fn fs_shape(
     // by itself puts 0.25 on an edge whose area is 0.5, and keeps
     // reading a half at the centre of a hairline however thin it gets.
     // The mirror of `nacelle::sdf::band_coverage`.
-    let has_fill = f32((s.flags >> 12u) & 1u);
     let has_stroke = f32((s.flags >> 13u) & 1u);
     let cov_in = clamp(0.5 - (d + s.stroke) / w, 0.0, 1.0);
     let a_band = max(cov - cov_in, 0.0) * has_stroke;
+    return vec2<f32>(cov, a_band);
+}
 
-    // 2.10's one composition, by area: the band is the stroke OVER the
-    // bed — `ring_fill` draws on the original rect and the border stands
-    // on it — the rest of the covered pixel is the bed alone, and the
-    // two are averaged by the areas they hold. Bed and edge share this
-    // record because they share a silhouette, so that silhouette blends
-    // exactly once. Straight alpha out, as every path here returns.
-    let s_a = a_band * s.stroke_c.a;
-    let f_a = color.a * has_fill;
+// `top` over `bottom`, straight alpha in and out — the mirror of
+// nacelle::sdf::over, and the identity that lets a wash drawn as its
+// own quad become a term in somebody else's fragment (3.3).
+fn over(top: vec4<f32>, bottom: vec4<f32>) -> vec4<f32> {
+    let a = top.a + bottom.a * (1.0 - top.a);
+    let premul = top.rgb * top.a + bottom.rgb * bottom.a * (1.0 - top.a);
+    // Nothing laid at all: the colour is unobservable, and the top's is
+    // as good a nothing as any.
+    return vec4<f32>(select(top.rgb, premul / max(a, 1e-5), a > 0.0), a);
+}
+
+// 2.10's one composition, by area: the band is the stroke OVER the
+// bed — `ring_fill` draws on the original rect and the border stands
+// on it — the rest of the covered pixel is the bed alone, and the
+// two are averaged by the areas they hold. Bed and edge share this
+// record because they share a silhouette, so that silhouette blends
+// exactly once. Straight alpha out, as every path here returns.
+fn shape_compose(fill: vec4<f32>, stroke_c: vec4<f32>, cov: f32, a_band: f32) -> vec4<f32> {
+    let s_a = a_band * stroke_c.a;
+    let f_a = fill.a;
     let alpha = cov * f_a + s_a * (1.0 - f_a);
-    let premul = s_a * s.stroke_c.rgb + f_a * (cov - s_a) * color.rgb;
+    let premul = s_a * stroke_c.rgb + f_a * (cov - s_a) * fill.rgb;
     // No band under this fragment: the bed's own colour, untouched. The
     // divide would return it to within an ulp; this returns it exactly.
-    let rgb = select(color.rgb, premul / max(alpha, 1e-5), s_a > 0.0);
-    return grade(vec4<f32>(rgb, alpha));
+    let rgb = select(fill.rgb, premul / max(alpha, 1e-5), s_a > 0.0);
+    return vec4<f32>(rgb, alpha);
+}
+
+@fragment
+fn fs_shape(
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) shape: u32,
+) -> @location(0) vec4<f32> {
+    // Overflowing shapes are clipped by the uploader (the MAX_SHAPES
+    // idiom); a vertex past the clip must read SOME record rather than
+    // out of bounds.
+    let s = shapes[min(shape, arrayLength(&shapes) - 1u)];
+    let p = uv;
+    let d = shape_distance(s, p);
+    let cb = shape_cover(s, d);
+    let has_fill = f32((s.flags >> 12u) & 1u);
+    let f_a = color.a * has_fill;
+    return grade(shape_compose(vec4<f32>(color.rgb, f_a), s.stroke_c, cb.x, cb.y));
+}
+
+// The FROSTED band of the vector lane (f3 3.3, K3b): the same record,
+// the same silhouette, the same composition — with the blurred scene
+// under it.
+//
+// Three layers reach one fragment here, and that is the whole point of
+// the entry point existing. Drawn as three quads they would blend the
+// SAME outline three times, and on a half-covered pixel each pass adds
+// alpha the surface does not have — `c·(1 − c)·a·b` of it, which is R4
+// under another name and reads as a heavy rim on exactly the arcs the
+// eye goes to. Here the frost, the wash and the border are folded
+// first and `cov` is applied once.
+//
+// The frost is sampled by SCREEN position, like `fs_blur` and for the
+// same reason: the blurred copy belongs to the picture, not to the
+// quad, so a surface may ride any animation without the frost sliding
+// under it. The rank it samples is the RUN's — the renderer binds one
+// pyramid target per run, which is why the toolkit has three
+// SHAPE_GLASS handles and the record has no rank field.
+@fragment
+fn fs_shape_glass(
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) shape: u32,
+) -> @location(0) vec4<f32> {
+    let s = shapes[min(shape, arrayLength(&shapes) - 1u)];
+    let p = uv;
+    let d = shape_distance(s, p);
+    let cb = shape_cover(s, d);
+    // The blurred scene times the record's tint: the same product the
+    // surface's own core draws through fs_blur, so core and band frost
+    // alike. The tint can only darken; the wash over it is the only
+    // layer that can brighten (the master's ladder at elev.*.glass).
+    let frost = textureSample(t_atlas, s_atlas, pos.xy / pc.screen) * s.tint;
+    let has_fill = f32((s.flags >> 12u) & 1u);
+    let wash = vec4<f32>(color.rgb, color.a * has_fill);
+    return grade(shape_compose(over(wash, frost), s.stroke_c, cb.x, cb.y));
 }
 "#;
 
@@ -270,6 +350,13 @@ mod tests {
     /// over-reads √2 on a 45° slope). Both are one-line regressions that
     /// compile, validate and look almost right, which is exactly the
     /// class of change a test has to hold.
+    ///
+    /// Two anchors moved with K3b and only because the code did: the
+    /// band and the composition now live in `shape_cover` and
+    /// `shape_compose`, which the frosted entry point calls as well, so
+    /// `s.stroke_c` reads `stroke_c` and `s.flags` reads `s.flags`
+    /// through the record the caller passed. The forms they hold are
+    /// the same forms, character for character otherwise.
     #[test]
     fn the_shape_fragment_keeps_the_reference_s_form() {
         let src = super::WGSL_SRC;
@@ -301,9 +388,58 @@ mod tests {
             src.contains("let f_a = color.a * has_fill;"),
             "the fill gate went missing: a stroke-only record would fill solid"
         );
-        assert!(src.contains("let s_a = a_band * s.stroke_c.a;"));
+        assert!(src.contains("let s_a = a_band * stroke_c.a;"));
         assert!(src.contains("let has_fill = f32((s.flags >> 12u) & 1u);"));
         assert!(src.contains("let has_stroke = f32((s.flags >> 13u) & 1u);"));
+        // …and ONE copy of each, which is what the functions are for:
+        // two entry points reading two fields of the same mathematics
+        // is how a lane grows two answers (the easing resolvers, three
+        // of them, two with the same bug — motion.rs).
+        assert_eq!(src.matches("fn shape_distance(").count(), 1);
+        assert_eq!(src.matches("dpdx(d)").count(), 1);
+        assert_eq!(src.matches("let alpha = cov * f_a + s_a * (1.0 - f_a);").count(), 1);
+    }
+
+    /// The FROSTED entry point's own contract (f3 §3.3), and every line
+    /// of it is a thing that would compile while drawing the wrong
+    /// picture.
+    ///
+    /// * It samples by SCREEN position — the blurred copy belongs to
+    ///   the picture, not to the quad, so a panel riding an animation
+    ///   must not carry its frost along. `fs_blur` has said this since
+    ///   glass existed; this is the same sentence in the second place
+    ///   it now has to be true.
+    /// * The frost MULTIPLIES the sample by the record's tint and the
+    ///   wash lies OVER the result. The other order is a different
+    ///   picture and an equally short line: the master's ladder says
+    ///   the tint can only darken and the wash is the only knob that
+    ///   brightens, which is precisely the asymmetry of these two
+    ///   operators.
+    /// * The three layers reach ONE `shape_compose` call. Two calls,
+    ///   or a second `grade`, would be R4 rebuilt by hand.
+    #[test]
+    fn the_frosted_fragment_samples_the_screen_and_lays_the_wash_over_the_tint() {
+        let src = super::WGSL_SRC;
+        let glass = src
+            .split("fn fs_shape_glass(")
+            .nth(1)
+            .expect("fs_shape_glass went missing");
+        assert!(glass.contains("textureSample(t_atlas, s_atlas, pos.xy / pc.screen)"));
+        assert!(glass.contains("* s.tint"), "the tint stopped multiplying the sample");
+        assert!(
+            glass.contains("over(wash, frost)"),
+            "the wash went under the frost, or the fold went away"
+        );
+        assert!(glass.contains("let p = uv;"), "the field lost its local point");
+        assert_eq!(glass.matches("shape_compose(").count(), 1, "two compositions");
+        assert_eq!(glass.matches("grade(").count(), 1, "graded twice");
+        // The record's fourth colour, in both languages.
+        assert!(src.contains("tint: vec4<f32>,"));
+        // And OVER is the identity nacelle::sdf::over states, not a mix.
+        assert!(src.contains("let a = top.a + bottom.a * (1.0 - top.a);"));
+        assert!(
+            src.contains("let premul = top.rgb * top.a + bottom.rgb * bottom.a * (1.0 - top.a);")
+        );
     }
 
     /// **Why f3 K4 cost this crate nothing.** The diagonal lane — every
@@ -330,12 +466,21 @@ mod tests {
     /// can be checked by running WGSL in this tree; both can be checked
     /// by reading it, which is what a contract between two crates is
     /// for.
+    ///
+    /// The slice is cut at the NEXT entry point on purpose. K3b gave
+    /// the lane a second one, and it reads `@builtin(position)` because
+    /// its frost belongs to the screen — a slice running to the end of
+    /// the file would find that word and call it a regression in the
+    /// wrong fragment.
     #[test]
     fn the_shape_fragment_reads_its_local_point_and_not_the_pixel_s() {
         let shape = super::WGSL_SRC
             .split("fn fs_shape(")
             .nth(1)
-            .expect("fs_shape went missing");
+            .expect("fs_shape went missing")
+            .split("@fragment")
+            .next()
+            .expect("fs_shape ran to the end of the file");
         let code: String = shape
             .lines()
             .map(|l| l.split("//").next().unwrap_or(""))
@@ -346,8 +491,47 @@ mod tests {
             !code.contains("builtin(position)") && !code.contains("frag_coord"),
             "the shape fragment started asking where the pixel is"
         );
-        // …and the width still comes from the field, inside this
-        // fragment, so an oriented frame needs no push constant.
-        assert!(code.contains("dpdx(d)") && code.contains("dpdy(d)"));
+        // …and the width still comes from the field — through
+        // `shape_cover`, which both entry points call and which is
+        // where `dpdx` now lives, so an oriented frame still needs no
+        // push constant.
+        let cover = super::WGSL_SRC
+            .split("fn shape_cover(")
+            .nth(1)
+            .expect("shape_cover went missing");
+        assert!(cover.contains("dpdx(d)") && cover.contains("dpdy(d)"));
+        assert!(code.contains("shape_cover(s, d)"));
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    /// **The two Shapes are one Shape.** The record is written by the
+    /// toolkit in Rust and read by this module in WGSL, and nothing but
+    /// agreement between two hand-written declarations keeps a
+    /// fragment from reading a corner where a colour is. Two crews are
+    /// editing the vector lane on two branches; this asks naga for the
+    /// std430 size of the struct it just parsed and compares it with
+    /// the Rust one, which carries its own `size_of` assertion.
+    ///
+    /// A size match is not a field-order match, and this cannot claim
+    /// to be one. It is the check that catches the change that actually
+    /// happens — a field added on one side and not the other — at the
+    /// moment it happens rather than at the first frosted panel.
+    #[test]
+    fn the_record_is_the_same_size_in_both_languages() {
+        let module = naga::front::wgsl::parse_str(super::WGSL_SRC).unwrap();
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let (handle, _) = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some("Shape"))
+            .expect("the WGSL module declares a Shape");
+        assert_eq!(
+            layouter[handle].size as usize,
+            std::mem::size_of::<nacelle::draw::Shape>(),
+            "the record grew on one side of the seam only"
+        );
     }
 }
