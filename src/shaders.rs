@@ -128,10 +128,16 @@ fn fs_image(
     return grade(textureSample(t_atlas, s_atlas, uv) * color);
 }
 
-// The vector core (f3 2.2/2.3/2.10), K2's slice: every record drawn as
-// its Box distance — round and chamfered corners per corner, one fill
-// and stroke mix in one record. `uv` carries the LOCAL position in px
+// The vector core (f3 2.2/2.3/2.10): every record drawn as its Box
+// distance — round and chamfered corners per corner, bed and border
+// composed by area in ONE record. `uv` carries the LOCAL position in px
 // from the record's centre; the atlas is not sampled here at all.
+//
+// nacelle::sdf is the specification this implements, function for
+// function: d_box, d_round, d_chamfer, coverage, band_coverage,
+// compose. A change here that is not also a change there is wrong by
+// definition — that file is where the mathematics is proved, on the
+// CPU, without a device.
 @fragment
 fn fs_shape(
     @location(0) uv: vec2<f32>,
@@ -185,17 +191,30 @@ fn fs_shape(
     let cov = clamp(0.5 - d / w, 0.0, 1.0);
 
     // The stroke band, INWARD from the boundary (the project's
-    // convention), and 2.10's one mix: bed and edge share this record
-    // because they share a silhouette, so the shared outer edge blends
-    // exactly once.
-    let d_band = max(d, -d - s.stroke);
-    let a_band = clamp(0.5 - d_band / w, 0.0, 1.0);
+    // convention), as an AREA: the interior LESS the interior inset by
+    // the stroke. One ramp minus the other, never the product of two —
+    // the band's outer boundary IS the silhouette, and a ramp weighted
+    // by itself puts 0.25 on an edge whose area is 0.5, and keeps
+    // reading a half at the centre of a hairline however thin it gets.
+    // The mirror of `nacelle::sdf::band_coverage`.
     let has_fill = f32((s.flags >> 12u) & 1u);
     let has_stroke = f32((s.flags >> 13u) & 1u);
-    let band = a_band * s.stroke_c.a * has_stroke;
-    let fill_a = color.a * has_fill;
-    let rgb = mix(color.rgb, s.stroke_c.rgb, band);
-    let alpha = cov * mix(fill_a, 1.0, band);
+    let cov_in = clamp(0.5 - (d + s.stroke) / w, 0.0, 1.0);
+    let a_band = max(cov - cov_in, 0.0) * has_stroke;
+
+    // 2.10's one composition, by area: the band is the stroke OVER the
+    // bed — `ring_fill` draws on the original rect and the border stands
+    // on it — the rest of the covered pixel is the bed alone, and the
+    // two are averaged by the areas they hold. Bed and edge share this
+    // record because they share a silhouette, so that silhouette blends
+    // exactly once. Straight alpha out, as every path here returns.
+    let s_a = a_band * s.stroke_c.a;
+    let f_a = color.a * has_fill;
+    let alpha = cov * f_a + s_a * (1.0 - f_a);
+    let premul = s_a * s.stroke_c.rgb + f_a * (cov - s_a) * color.rgb;
+    // No band under this fragment: the bed's own colour, untouched. The
+    // divide would return it to within an ulp; this returns it exactly.
+    let rgb = select(color.rgb, premul / max(alpha, 1e-5), s_a > 0.0);
     return grade(vec4<f32>(rgb, alpha));
 }
 "#;
@@ -238,5 +257,38 @@ mod tests {
         assert!(super::WGSL_SRC.contains("mat3x3<f32>"));
         let spv = super::compile();
         assert!(!spv.is_empty());
+    }
+
+    /// The two retired forms, kept out by name.
+    ///
+    /// `nacelle::sdf` proves the arithmetic on the CPU; nothing here can
+    /// run WGSL, so what this side can guarantee is only that the shader
+    /// has not drifted BACK — that the band is still a difference of two
+    /// coverage ramps rather than the folded field times the silhouette
+    /// (which put 0.25 on an edge covering 0.5), and that the AA width
+    /// is still the gradient's length rather than `fwidth` (which
+    /// over-reads √2 on a 45° slope). Both are one-line regressions that
+    /// compile, validate and look almost right, which is exactly the
+    /// class of change a test has to hold.
+    #[test]
+    fn the_shape_fragment_keeps_the_reference_s_form() {
+        let src = super::WGSL_SRC;
+        // The retired forms are NAMED in the comments that retired them,
+        // so the negative assertions read the code alone.
+        let code: String = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("fwidth"), "the AA width went back to fwidth");
+        assert!(
+            !code.contains("max(d, -d - s.stroke)"),
+            "the folded band came back — see nacelle::sdf::band_coverage"
+        );
+        // The difference of ramps, and the area composition it feeds.
+        assert!(src.contains("let cov_in = clamp(0.5 - (d + s.stroke) / w, 0.0, 1.0);"));
+        assert!(src.contains("let a_band = max(cov - cov_in, 0.0) * has_stroke;"));
+        assert!(src.contains("let alpha = cov * f_a + s_a * (1.0 - f_a);"));
+        assert!(src.contains("let g = vec2<f32>(dpdx(d), dpdy(d));"));
     }
 }
