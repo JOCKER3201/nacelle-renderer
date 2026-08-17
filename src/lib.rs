@@ -14,6 +14,11 @@
 
 mod gfx;
 mod shaders;
+/// The shape fragment's own arithmetic, evaluated over naga's IR and
+/// checked against plain geometry — the one thing this crate can prove
+/// about its WGSL without a device. Test-only; nothing ships it.
+#[cfg(test)]
+mod shape_field;
 mod timing;
 
 /// What the shaders cost, counted in instructions rather than in
