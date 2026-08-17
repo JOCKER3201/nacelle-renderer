@@ -305,4 +305,49 @@ mod tests {
         assert!(src.contains("let has_fill = f32((s.flags >> 12u) & 1u);"));
         assert!(src.contains("let has_stroke = f32((s.flags >> 13u) & 1u);"));
     }
+
+    /// **Why f3 K4 cost this crate nothing.** The diagonal lane — every
+    /// tick, chevron, sort arrow, chart stroke and joint disc — is a
+    /// Box record read along its own axes, and the only thing that
+    /// makes it one is where the CPU puts four vertices and what it
+    /// writes in their `uv`. That works because of two properties of
+    /// the fragment below, and both are one careless line from being
+    /// lost:
+    ///
+    /// * **The local point comes from `uv`** — an interpolated varying,
+    ///   which the rasteriser has already run backwards through
+    ///   whatever affine map the vertices described. Reading
+    ///   `@builtin(position)` instead would compile, would look
+    ///   identical on every axis-aligned shape K3 draws, and would draw
+    ///   every diagonal in the wrong frame.
+    /// * **The AA width comes from the field's own screen
+    ///   derivatives** — so a rotation (|∇d| = 1) and a shear (|∇d|
+    ///   whatever it is) both come out right without the shader being
+    ///   told which it got. A constant width, or one read off a push
+    ///   constant, would be correct only on the screen's own axes.
+    ///
+    /// The first is asserted here, the second by the test above. Neither
+    /// can be checked by running WGSL in this tree; both can be checked
+    /// by reading it, which is what a contract between two crates is
+    /// for.
+    #[test]
+    fn the_shape_fragment_reads_its_local_point_and_not_the_pixel_s() {
+        let shape = super::WGSL_SRC
+            .split("fn fs_shape(")
+            .nth(1)
+            .expect("fs_shape went missing");
+        let code: String = shape
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code.contains("let p = uv;"), "the local point stopped being the varying");
+        assert!(
+            !code.contains("builtin(position)") && !code.contains("frag_coord"),
+            "the shape fragment started asking where the pixel is"
+        );
+        // …and the width still comes from the field, inside this
+        // fragment, so an oriented frame needs no push constant.
+        assert!(code.contains("dpdx(d)") && code.contains("dpdy(d)"));
+    }
 }
