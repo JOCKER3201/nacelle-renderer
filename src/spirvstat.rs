@@ -1051,4 +1051,79 @@ mod tests {
         assert!(text.contains("with grade"));
         assert!(text.contains("samples="));
     }
+
+    /// **K3c, measurement 1: what one fragment of the vector lane costs
+    /// against one fragment of the lane it replaces.**
+    ///
+    /// The numbers are pinned rather than printed, because the question
+    /// K3d has to answer — "is the switch worth flipping" — is answered
+    /// on these, and a figure that drifts silently is worse than none.
+    /// A shader edit that moves them is meant to fail here and be
+    /// re-argued in `.gap-program/pomiar-wektor-k3c.md`.
+    ///
+    /// # The ratio the plan quotes, and the ratio a frame actually pays
+    ///
+    /// f3 §7b compares the two lanes as `~101` against `~5`. Measured
+    /// through this module the OWN BODIES are 78 and 4 — a ratio of
+    /// 19.5 — and that is the right number for "what does the SDF cost
+    /// me over a plain fill", but it is not what a frame pays. Both
+    /// fragments call `grade()`, and grade is nine compute instructions
+    /// and a LUT sample that neither lane can avoid. With it the whole
+    /// fragments are 87 against 13, a ratio of **6.7**, and that is the
+    /// number to hold up against a frame time.
+    ///
+    /// Two things the ratio hides, both in the vector lane's favour:
+    ///
+    /// * `fs_shape` takes ONE texture sample where `fs_main` takes two
+    ///   — it reads no atlas. A sample is a memory trip, not an ALU
+    ///   slot, so the trade is 74 arithmetic instructions against one
+    ///   fetch, and which side that lands on is a property of the
+    ///   device's occupancy rather than of this count.
+    /// * Of `fs_shape`'s own 78, nineteen are `GLSL.std.450` calls and
+    ///   thirty-nine are composite shuffles that `mem2reg` deletes
+    ///   before the hardware sees them. The count is an upper bound on
+    ///   ALU (this module's own header says so); three of the extended
+    ///   calls are `length`, which is a dot and a square root each, so
+    ///   the hardware-weighted figure moves in both directions and
+    ///   cannot be settled from here at all.
+    #[test]
+    fn the_shape_lane_costs_what_the_measurement_says_it_costs() {
+        let m = builtin().unwrap();
+        let cost = |name: &str| {
+            m.costs()
+                .into_iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} is missing"))
+        };
+        let fs_main = cost("fs_main");
+        let fs_shape = cost("fs_shape");
+
+        // The lane-only comparison: each fragment's own body, grade
+        // excluded because both pay it.
+        assert_eq!(fs_main.own.compute(), 4, "the plain fill lane moved");
+        assert_eq!(fs_shape.own.compute(), 78, "the shape lane moved");
+
+        // The whole-fragment comparison: what the GPU actually runs.
+        assert_eq!(fs_main.total.compute(), 13);
+        assert_eq!(fs_shape.total.compute(), 87);
+        assert_eq!(fs_main.total.total(), 54);
+        assert_eq!(fs_shape.total.total(), 174);
+
+        // The trade that the ratio hides: the shape lane reads no atlas.
+        assert_eq!(fs_main.total.samples(), 2);
+        assert_eq!(fs_shape.total.samples(), 1);
+
+        // And the shape of the shape lane's own cost, so a rewrite that
+        // keeps the total and moves the mix is still visible.
+        assert_eq!(fs_shape.own.class(Class::Alu), 57);
+        assert_eq!(fs_shape.own.class(Class::Math), 19);
+        assert_eq!(fs_shape.own.class(Class::Deriv), 2);
+        assert_eq!(fs_shape.own.class(Class::Texture), 0);
+        assert_eq!(
+            fs_shape.total.glsl().iter().find(|(n, _)| n == "Length").map(|(_, c)| *c),
+            Some(3),
+            "three square roots: the box distance, the AA gradient and the corner"
+        );
+    }
+
 }
