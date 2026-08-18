@@ -14,6 +14,12 @@
 
 mod gfx;
 mod shaders;
+/// The shape fragment's own arithmetic, evaluated over naga's IR and
+/// checked twice without a device: against plain geometry, and against
+/// `nacelle::sdf::d_record`, the specification it claims to mirror.
+/// Test-only; nothing ships it.
+#[cfg(test)]
+mod shape_field;
 mod timing;
 
 /// What the shaders cost, counted in instructions rather than in

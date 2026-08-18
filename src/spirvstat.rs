@@ -1008,7 +1008,7 @@ mod tests {
 
     /// **What K3b's split into functions cost the shape lane, and what
     /// it did not.** The field's mathematics moved out of `fs_shape`'s
-    /// body into `shape_distance`/`shape_cover`/`over`/`shape_compose`
+    /// body into `shape_field`/`shape_cover`/`over`/`shape_compose`
     /// so that the frosted entry point could call the same forms
     /// instead of carrying a second copy of them. That moved a number
     /// every measurement of this lane is quoted from, and a moved
@@ -1020,9 +1020,19 @@ mod tests {
     /// 57 → 5, because the body is now a call; `total.total()`
     /// 174 → 199, the 25 being OpFunction / OpFunctionParameter /
     /// OpLabel / OpReturnValue / OpFunctionCall and the locals they
-    /// need. THE WORK IS UNCHANGED TO THE INSTRUCTION, and that is
-    /// what the two assertions below pin: reachable compute and
-    /// reachable ALU are the same numbers as before K3b.
+    /// need. THE WORK WAS UNCHANGED TO THE INSTRUCTION by that move:
+    /// reachable compute stayed at 87 and reachable ALU at 63.
+    ///
+    /// **K6 then changed the work itself, which is what the numbers
+    /// below now say.** `shape_field` computes the arc, the hexagon and
+    /// the chevron for every fragment of every record, because a branch
+    /// on the record's own kind is not uniform across a draw and
+    /// `shape_cover` takes derivatives of what it returns. Reachable
+    /// compute 87 → 161 and ALU 63 → 114 are the price of the KINDS,
+    /// not of the split — the two are told apart by `own`, which stayed
+    /// exactly where K3b left it. The remedy the field's own comment
+    /// names is one pipeline per kind, keyed on the run; until that
+    /// exists a Box record pays for a hexagon it will never draw.
     ///
     /// Which is also the lesson for whoever pins the next one: on an
     /// entry point that calls anything, `own` measures where the code
@@ -1036,16 +1046,31 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "fs_shape")
             .expect("fs_shape is missing");
-        assert_eq!(shape.total.compute(), 87, "the field's work changed");
-        assert_eq!(shape.total.class(Class::Alu), 63, "the field's ALU changed");
+        assert_eq!(shape.total.compute(), 161, "the field's work changed");
+        assert_eq!(shape.total.class(Class::Alu), 114, "the field's ALU changed");
         // And the body itself is now scaffolding: a handful of loads
         // and four calls. If this grows, the mathematics came back —
         // which is the second copy K3b existed to prevent.
         assert!(shape.own.compute() < 20, "the field moved back into the body");
         assert_eq!(
             shape.callees,
-            vec!["grade", "shape_compose", "shape_cover", "shape_distance"],
+            vec!["grade", "shape_compose", "shape_cover", "shape_field"],
             "the plain lane's callees are the shared forms and the grade"
+        );
+        // The frosted entry point calls the SAME field, and its extra
+        // cost is its own three layers rather than a second silhouette.
+        // A copied field would show up here as a number near twice this
+        // one, which is precisely the failure K3b's split prevents and
+        // no string search can see.
+        let glass = m
+            .costs()
+            .into_iter()
+            .find(|c| c.name == "fs_shape_glass")
+            .expect("fs_shape_glass is missing");
+        assert_eq!(glass.total.compute(), 177, "the frosted lane's work changed");
+        assert!(
+            glass.callees.contains(&"shape_field".to_string()),
+            "the frosted entry point stopped sharing the field"
         );
     }
 
@@ -1122,30 +1147,49 @@ mod tests {
     /// A shader edit that moves them is meant to fail here and be
     /// re-argued in `.gap-program/pomiar-wektor-k3c.md`.
     ///
+    /// # Where the pins sit, and why they moved off `own`
+    ///
+    /// They were written on `own` when the whole lane was one fragment
+    /// body. K3b split it into functions and K6 grew the field, and
+    /// after both `own` measures only the four call instructions the
+    /// body has left. So the pins sit on `total`, which is what this
+    /// module's own header says a budget must be taken on, and the
+    /// bodies are pinned separately as the scaffolding they now are.
+    ///
     /// # The ratio the plan quotes, and the ratio a frame actually pays
     ///
     /// f3 §7b compares the two lanes as `~101` against `~5`. Measured
-    /// through this module the OWN BODIES are 78 and 4 — a ratio of
-    /// 19.5 — and that is the right number for "what does the SDF cost
-    /// me over a plain fill", but it is not what a frame pays. Both
-    /// fragments call `grade()`, and grade is nine compute instructions
-    /// and a LUT sample that neither lane can avoid. With it the whole
-    /// fragments are 87 against 13, a ratio of **6.7**, and that is the
-    /// number to hold up against a frame time.
+    /// through this module, before K6, the whole fragments were 87
+    /// against 13 — a ratio of **6.7**, the number
+    /// `.gap-program/pomiar-wektor-k3c.md` carries and the number that
+    /// corrected §7b's own 19.5 (which compared bodies and forgot that
+    /// both lanes pay `grade()`: nine compute instructions and a LUT
+    /// sample neither can avoid).
+    ///
+    /// **K6 moved it again, and this is the note §7b asked for.** The
+    /// kinds are computed unconditionally — a branch on the record's
+    /// kind would break the derivative uniformity `shape_cover` needs —
+    /// so every fragment of every record now evaluates the arc, the
+    /// hexagon and the chevron as well as the box. The whole fragments
+    /// are **161 against 13, a ratio of 12.4**, and that is the number
+    /// to hold up against a frame time. Everything the measurement note
+    /// derives per silhouette (the 4.25x, the perimeter-to-area
+    /// argument) was computed on the 6.7 and has NOT been re-run here.
     ///
     /// Two things the ratio hides, both in the vector lane's favour:
     ///
     /// * `fs_shape` takes ONE texture sample where `fs_main` takes two
     ///   — it reads no atlas. A sample is a memory trip, not an ALU
-    ///   slot, so the trade is 74 arithmetic instructions against one
+    ///   slot, so the trade is 148 arithmetic instructions against one
     ///   fetch, and which side that lands on is a property of the
     ///   device's occupancy rather than of this count.
-    /// * Of `fs_shape`'s own 78, nineteen are `GLSL.std.450` calls and
-    ///   thirty-nine are composite shuffles that `mem2reg` deletes
-    ///   before the hardware sees them. The count is an upper bound on
-    ///   ALU (this module's own header says so); three of the extended
-    ///   calls are `length`, which is a dot and a square root each, so
-    ///   the hardware-weighted figure moves in both directions and
+    /// * Of the fragment's 330 instructions only 161 are compute; the
+    ///   rest are loads, access chains and composite shuffles that
+    ///   `mem2reg` deletes before the hardware sees them. The count is
+    ///   an upper bound on ALU (this module's own header says so), and
+    ///   43 of the 161 are `GLSL.std.450` calls the hardware weighs its
+    ///   own way — six of them `length`, a dot and a square root each —
+    ///   so the hardware-weighted figure moves in both directions and
     ///   cannot be settled from here at all.
     #[test]
     fn the_shape_lane_costs_what_the_measurement_says_it_costs() {
@@ -1159,32 +1203,33 @@ mod tests {
         let fs_main = cost("fs_main");
         let fs_shape = cost("fs_shape");
 
-        // The lane-only comparison: each fragment's own body, grade
-        // excluded because both pay it.
-        assert_eq!(fs_main.own.compute(), 4, "the plain fill lane moved");
-        assert_eq!(fs_shape.own.compute(), 78, "the shape lane moved");
-
-        // The whole-fragment comparison: what the GPU actually runs.
-        assert_eq!(fs_main.total.compute(), 13);
-        assert_eq!(fs_shape.total.compute(), 87);
+        // The whole-fragment comparison: what the GPU actually runs,
+        // grade included, because both lanes run it.
+        assert_eq!(fs_main.total.compute(), 13, "the plain fill lane moved");
+        assert_eq!(fs_shape.total.compute(), 161, "the shape lane moved");
         assert_eq!(fs_main.total.total(), 54);
-        assert_eq!(fs_shape.total.total(), 174);
+        assert_eq!(fs_shape.total.total(), 330);
+
+        // The bodies, which are no longer the lanes: one reads a
+        // texture and grades it, the other is four calls.
+        assert_eq!(fs_main.own.compute(), 4, "the plain fill body moved");
+        assert_eq!(fs_shape.own.compute(), 6, "the shape body stopped being a call");
 
         // The trade that the ratio hides: the shape lane reads no atlas.
         assert_eq!(fs_main.total.samples(), 2);
         assert_eq!(fs_shape.total.samples(), 1);
 
-        // And the shape of the shape lane's own cost, so a rewrite that
+        // And the shape of the shape lane's cost, so a rewrite that
         // keeps the total and moves the mix is still visible.
-        assert_eq!(fs_shape.own.class(Class::Alu), 57);
-        assert_eq!(fs_shape.own.class(Class::Math), 19);
-        assert_eq!(fs_shape.own.class(Class::Deriv), 2);
+        assert_eq!(fs_shape.total.class(Class::Alu), 114);
+        assert_eq!(fs_shape.total.class(Class::Math), 43);
+        assert_eq!(fs_shape.total.class(Class::Deriv), 2);
         assert_eq!(fs_shape.own.class(Class::Texture), 0);
         assert_eq!(
             fs_shape.total.glsl().iter().find(|(n, _)| n == "Length").map(|(_, c)| *c),
-            Some(3),
-            "three square roots: the box distance, the AA gradient and the corner"
+            Some(6),
+            "six square roots: the box distance, the rounded corner, the AA \
+             gradient, the hexagon's fold and the arc's two branches"
         );
     }
-
 }

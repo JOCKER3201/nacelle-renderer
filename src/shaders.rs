@@ -89,6 +89,11 @@ struct Shape {
 // does not parse `const` inside a function body.
 const SQRT1_2: f32 = 0.70710678118654752;
 
+// The six-fold lattice, for the hexagon: the mirror normal
+// (-cos 30, sin 30) that folds a quadrant into one sixth, and 1/sqrt(3),
+// half of one edge in units of the apothem.
+const HK: vec3<f32> = vec3<f32>(-0.8660254, 0.5, 0.5773503);
+
 // The grading LUT, applied last in every fragment path. Identity when
 // pc.lut is zero.
 fn grade(c: vec4<f32>) -> vec4<f32> {
@@ -132,30 +137,42 @@ fn fs_image(
     return grade(textureSample(t_atlas, s_atlas, uv) * color);
 }
 
-// The vector core (f3 2.2/2.3/2.10): every record drawn as its Box
-// distance — round and chamfered corners per corner, bed and border
-// composed by area in ONE record. `uv` carries the LOCAL position in px
-// from the record's centre; the atlas is not sampled here at all.
+// **The distance ONE record computes** — the whole of the silhouette,
+// and the only part of this file whose arithmetic can be checked
+// without a device.
 //
-// nacelle::sdf is the specification this implements, function for
-// function: d_box, d_round, d_chamfer, coverage, band_coverage, over,
-// compose. A change here that is not also a change there is wrong by
-// definition — that file is where the mathematics is proved, on the
-// CPU, without a device.
+// It is a function and not a stretch of `fs_shape` for two reasons that
+// arrived on two branches and ask for the same thing.
 //
-// The three functions below carry the whole of it, and they are
-// functions rather than a body because K3b gave the lane a SECOND entry
-// point (fs_shape_glass). Two copies of one field would be two answers
-// waiting to differ, which is exactly the defect this project spent a
-// milestone removing from its easing resolvers.
-
-// The Box family's distance under four per-corner treatments — the
-// mirror of nacelle::sdf::d_shape. No derivatives here: this is a pure
-// function of the local point, and that is what lets the caller take
-// its screen gradient.
-fn shape_distance(s: Shape, p: vec2<f32>) -> f32 {
-    let b = s.half_size;
-
+// K3b gave the lane a SECOND entry point (`fs_shape_glass`). Two copies
+// of one field would be two answers waiting to differ, which is exactly
+// the defect this project spent a milestone removing from its easing
+// resolvers — so both entry points call THIS, and the count is asserted.
+//
+// K6 gave the field a way to be CHECKED. `nacelle::sdf::d_record` is the
+// specification it implements, line for line, and "a change here that is
+// not also a change there is wrong by definition" was a promise with
+// nothing keeping it: the tests below could only quote the source back
+// at itself. A pure function of six plain arguments — no textures, no
+// derivatives, no control flow — is one an evaluator can run over naga's
+// own IR, which is what `the_shape_field_draws_the_silhouette_it_claims`
+// does. The arguments are spelled out rather than passed as the record
+// so that the evaluator never has to know the struct's layout, only its
+// numbers; that is why the callers below unpack `s` at the call rather
+// than handing the record over.
+//
+// The record's slots are read exactly as the table on
+// nacelle::draw::ShapeKind states them: lengths in `corner`, angles in
+// `arc_half` / `arc_dir`, the kind in bits 8-11 of `flags` and the four
+// corner treatments in bits 0-7.
+fn shape_field(
+    p: vec2<f32>,
+    b: vec2<f32>,
+    corner: vec4<f32>,
+    flags: u32,
+    arc_half: f32,
+    arc_dir: f32,
+) -> f32 {
     // The exact box distance.
     let q = abs(p) - b;
     let d_box = min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0)));
@@ -166,10 +183,10 @@ fn shape_distance(s: Shape, p: vec2<f32>) -> f32 {
     let ix = select(select(0u, 1u, p.x >= 0.0),
                     select(3u, 2u, p.x >= 0.0),
                     p.y >= 0.0);
-    let top = select(s.corner.x, s.corner.y, p.x >= 0.0);
-    let bot = select(s.corner.w, s.corner.z, p.x >= 0.0);
+    let top = select(corner.x, corner.y, p.x >= 0.0);
+    let bot = select(corner.w, corner.z, p.x >= 0.0);
     let k = select(top, bot, p.y >= 0.0);
-    let st = (s.flags >> (2u * ix)) & 3u;
+    let st = (flags >> (2u * ix)) & 3u;
 
     // The rounded corner: the exact rounded-box distance at radius k.
     let qk = q + vec2<f32>(k);
@@ -186,6 +203,72 @@ fn shape_distance(s: Shape, p: vec2<f32>) -> f32 {
     var d = d_box;
     d = select(d, d_rnd, st == 1u);
     d = select(d, d_chm, st == 2u);
+
+    // ---- the kinds past Box (K6, bits 8-11) -------------------------
+    //
+    // Until K6 the shape lane drew EVERY record as the box distance
+    // above and never looked at bits 8-11, so a Hex record and a Box
+    // record of the same rect were the same picture. They are not any
+    // more. Each field below is the mirror of a function in
+    // nacelle::sdf — d_hex, d_arc, d_chevron — and the record's
+    // per-kind slots are read exactly as the table on
+    // nacelle::draw::ShapeKind states them: lengths in `corner`, angles
+    // in `arc_half` / `arc_dir`.
+    //
+    // Computed UNCONDITIONALLY and composed by select, like the corner
+    // treatments and for a harder reason: the `dpdx`/`dpdy` that
+    // `shape_cover` takes of what this returns must sit in uniform
+    // control flow, and a branch on a record's own kind is not uniform
+    // across a draw. Every fragment therefore pays for every kind. That
+    // is a measured cost for K3c to answer — the honest remedy is one
+    // pipeline per kind, keyed on the run, not a branch here.
+    let kind = (flags >> 8u) & 0xFu;
+
+    // The local point seen from a frame turned by arc_dir: the two
+    // kinds that carry an angle share it, and rotating the question is
+    // the same as rotating the shape.
+    let ca = cos(arc_dir);
+    let sa = sin(arc_dir);
+    let pt = vec2<f32>(p.x * ca + p.y * sa, -p.x * sa + p.y * ca);
+
+    // Hex: the flat-topped hexagon of apothem corner.x, folded into one
+    // sixth and read against that sixth's single edge.
+    var hp = abs(pt);
+    hp = hp - 2.0 * min(dot(HK.xy, hp), 0.0) * HK.xy;
+    hp = hp - vec2<f32>(clamp(hp.x, -HK.z * corner.x, HK.z * corner.x), corner.x);
+    // sign(0.0) is zero in WGSL and one in Rust, so the sign is a
+    // comparison in both files rather than a call in either.
+    let d_hexagon = length(hp) * select(-1.0, 1.0, hp.y >= 0.0);
+
+    // Ring: the annular arc, half width corner.x, its outer edge on the
+    // shorter side of the rect, swept 2*arc_half about local +y with
+    // round caps. Clamping sin at zero is what makes arc_half >= PI a
+    // CLOSED ring: a non-positive left side can never beat zero, so
+    // every fragment takes the circle (sin(PI) in f32 is a hair below
+    // zero, and that hair used to decide it).
+    let rb = corner.x;
+    let ra = max(min(b.x, b.y) - rb, 0.0);
+    let sn = max(sin(arc_half), 0.0);
+    let cs = cos(arc_half);
+    let ap = vec2<f32>(abs(pt.x), pt.y);
+    let d_cap = length(ap - vec2<f32>(sn, cs) * ra) - rb;
+    let d_ann = abs(length(ap) - ra) - rb;
+    let d_ring = select(d_ann, d_cap, cs * ap.x > sn * ap.y);
+
+    // Chevron: the box with one or both vertical ends collapsed to a
+    // point at mid-height, corner.x deep on the left and corner.y on
+    // the right. abs(p.y) folds each end's two slanted edges into one
+    // half-plane; a depth of zero gives back that end's own vertical
+    // edge exactly, so an uncollapsed end needs no second formula.
+    let ll = max(sqrt(b.y * b.y + corner.x * corner.x), 1e-6);
+    let lr = max(sqrt(b.y * b.y + corner.y * corner.y), 1e-6);
+    let cut_l = (corner.x * abs(p.y) - b.y * (p.x + b.x)) / ll;
+    let cut_r = (corner.y * abs(p.y) - b.y * (b.x - p.x)) / lr;
+    let d_chevron = max(d_box, max(cut_l, cut_r));
+
+    d = select(d, d_ring, kind == 1u);
+    d = select(d, d_hexagon, kind == 2u);
+    d = select(d, d_chevron, kind == 3u);
     return d;
 }
 
@@ -242,6 +325,27 @@ fn shape_compose(fill: vec4<f32>, stroke_c: vec4<f32>, cov: f32, a_band: f32) ->
     return vec4<f32>(rgb, alpha);
 }
 
+// The vector core (f3 2.2/2.3/2.10): one record, one distance field,
+// bed and border composed by area. `uv` carries the LOCAL position in
+// px from the record's centre; the atlas is not sampled here at all.
+//
+// The SILHOUETTE is `shape_field` above — one function, chosen by kind,
+// with its own tests. What is left to the entry points is what needs a
+// fragment: the record, the screen derivatives (`shape_cover`) and
+// 2.10's composition by area (`shape_compose`), and both of those are
+// shared with the frosted band below for the same reason the field is.
+//
+// nacelle::sdf is the specification all of it implements, function for
+// function: d_box, d_round, d_chamfer, d_hex, d_arc, d_chevron,
+// d_record, coverage, band_coverage, over, compose. A change here that
+// is not also a change there is wrong by definition — that file is where
+// the mathematics is proved, on the CPU, without a device. Two tests
+// keep the seam honest and neither needs a GPU:
+// `the_shape_field_draws_the_silhouette_it_claims` runs this shader's
+// own field over naga's IR against silhouettes stated as GEOMETRY, and
+// `the_field_answers_what_the_reference_answers` runs it against
+// `nacelle::sdf::d_record` itself, record for record — which the lock
+// only made possible when it was bumped past K6.
 @fragment
 fn fs_shape(
     @location(0) uv: vec2<f32>,
@@ -253,7 +357,7 @@ fn fs_shape(
     // out of bounds.
     let s = shapes[min(shape, arrayLength(&shapes) - 1u)];
     let p = uv;
-    let d = shape_distance(s, p);
+    let d = shape_field(p, s.half_size, s.corner, s.flags, s.arc_half, s.arc_dir);
     let cb = shape_cover(s, d);
     let has_fill = f32((s.flags >> 12u) & 1u);
     let f_a = color.a * has_fill;
@@ -302,7 +406,7 @@ fn fs_shape_glass(
 ) -> @location(0) vec4<f32> {
     let s = shapes[min(shape, arrayLength(&shapes) - 1u)];
     let p = uv;
-    let d = shape_distance(s, p);
+    let d = shape_field(p, s.half_size, s.corner, s.flags, s.arc_half, s.arc_dir);
     let cb = shape_cover(s, d);
     // The blurred scene times the record's tint: the same product the
     // surface's own core draws through fs_blur, so core and band frost
@@ -410,8 +514,13 @@ mod tests {
         // …and ONE copy of each, which is what the functions are for:
         // two entry points reading two fields of the same mathematics
         // is how a lane grows two answers (the easing resolvers, three
-        // of them, two with the same bug — motion.rs).
-        assert_eq!(src.matches("fn shape_distance(").count(), 1);
+        // of them, two with the same bug — motion.rs). The field is
+        // named `shape_field` and not `shape_distance` because the
+        // evaluator that RUNS it looks it up by that name; the two
+        // spellings met in a merge, and the one that can be executed
+        // won.
+        assert_eq!(src.matches("fn shape_field(").count(), 1);
+        assert_eq!(src.matches("shape_field(p, s.half_size,").count(), 2, "an entry point grew its own field");
         assert_eq!(src.matches("dpdx(d)").count(), 1);
         assert_eq!(src.matches("let alpha = cov * f_a + s_a * (1.0 - f_a);").count(), 1);
     }
@@ -476,6 +585,426 @@ mod tests {
         assert!(
             src.contains("let premul = top.rgb * top.a + bottom.rgb * bottom.a * (1.0 - top.a);")
         );
+    }
+
+    /// K6's own regression, read: bits 8-11 must still be READ, the
+    /// selection must stay a `select`, and the field must stay a
+    /// function the evaluator can run.
+    ///
+    /// The trap this holds shut is the one f3 §4 named before K6 was
+    /// written — "fs_shape draws every record as its box distance and
+    /// never reads bits 8-11", so a Hex record and a Box record of the
+    /// same rect drew the same picture and nothing complained.
+    ///
+    /// These are the invariants a NUMBER cannot see, and they are all
+    /// this test is now for; what the arithmetic computes is
+    /// `the_shape_field_draws_the_silhouette_it_claims`, one test down.
+    /// The two used to be one, and the string half was standing in for
+    /// the other: six arithmetic mutations inside this branch passed the
+    /// whole gate, because a test can only hold the lines it quotes.
+    #[test]
+    fn the_shape_fragment_chooses_its_field_by_kind() {
+        let field = super::WGSL_SRC
+            .split("fn shape_field(")
+            .nth(1)
+            .expect("shape_field went missing — the field stopped being one function")
+            .split("\n}")
+            .next()
+            .expect("shape_field never closes");
+        let code: String = field
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("let kind = (flags >> 8u) & 0xFu;"),
+            "the kind stopped being read out of bits 8-11"
+        );
+        for (want, what) in [
+            ("d = select(d, d_ring, kind == 1u);", "Ring"),
+            ("d = select(d, d_hexagon, kind == 2u);", "Hex"),
+            ("d = select(d, d_chevron, kind == 3u);", "Chevron"),
+        ] {
+            assert!(code.contains(want), "{what} lost its branch: the box would draw instead");
+        }
+        // The per-kind slots, read where the record puts them.
+        assert!(code.contains("arc_half"), "the sweep went unread");
+        assert!(code.contains("arc_dir"), "the turn went unread");
+        // No BRANCH may wrap the fields: `fs_shape` takes the
+        // derivatives of what this returns, and those must sit in
+        // uniform control flow. WGSL makes the parentheses optional, so
+        // the word is what is looked for — the old spelling `if (` was
+        // blind to `if kind == 1u {`, which is how one would actually be
+        // written.
+        for banned in ["if ", "switch ", "loop ", "while ", "for "] {
+            assert!(
+                !code.contains(banned),
+                "`{banned}` in shape_field: a branch on the kind breaks derivative uniformity"
+            );
+        }
+        // And the field stays a function of PLAIN numbers. A struct
+        // argument would compile and would put the evaluator below out
+        // of reach of the record's own layout.
+        assert!(
+            code.contains(") -> f32 {") || super::WGSL_SRC.contains(") -> f32 {"),
+            "shape_field stopped answering a distance"
+        );
+    }
+
+    /// **The arithmetic of the kind branch, RUN.**
+    ///
+    /// Nothing in this crate can execute WGSL — but naga has already
+    /// parsed it by the time a test runs, so `crate::shape_field`
+    /// evaluates `shape_field` over naga's own IR and this compares the
+    /// answer against the silhouette stated as GEOMETRY: the hexagon's
+    /// six vertices at their clock positions, the chevron's six corners,
+    /// the arc's centre curve, the box's own outline. A distance to a
+    /// polygon knows nothing about mirror normals or folded quadrants,
+    /// so agreement is evidence and not a coincidence.
+    ///
+    /// Two grades of agreement, because two of the fields are honestly
+    /// approximate. `max` of half-planes is the exact distance inside a
+    /// convex silhouette and an UNDERESTIMATE outside it, in the acute
+    /// wedge behind a vertex — §2.2 accepted that trade for the chamfer
+    /// and K6 took it again for the chevron. So those two are held to
+    /// the exact distance on the inside and to the SIGN everywhere,
+    /// which is the whole of what coverage reads; the box, the rounded
+    /// box, the hexagon and the arc are exact fields and are held to the
+    /// number everywhere.
+    #[test]
+    fn the_shape_field_draws_the_silhouette_it_claims() {
+        use crate::shape_field::{
+            arc_curve, box_poly, chevron_poly, curve_dist, hex_poly, poly_sd, Field, Record,
+        };
+        let module =
+            naga::front::wgsl::parse_str(super::WGSL_SRC).expect("the shader must parse");
+        let mut field = Field::new(&module, "shape_field");
+
+        /// The corner treatments, packed as the record packs them: two
+        /// bits each, tl tr br bl, and the kind in bits 8-11.
+        fn flags(kind: u32, styles: [u32; 4]) -> u32 {
+            (kind << 8) | styles.iter().enumerate().fold(0, |f, (i, s)| f | (s << (2 * i)))
+        }
+
+        // (name, record, reference distance, exact everywhere)
+        let sq = box_poly([60.0, 36.0], [(0, 0.0); 4]);
+        let rn = box_poly([60.0, 36.0], [(1, 14.0); 4]);
+        let ch = box_poly([60.0, 36.0], [(2, 12.0); 4]);
+        let mx = box_poly([60.0, 36.0], [(1, 14.0), (2, 12.0), (0, 0.0), (1, 6.0)]);
+        let hex_flat = hex_poly(40.0, 0.0);
+        // 15°: NOT a symmetry of a six-fold lattice, so a turn that ran
+        // the other way would put the flat edge somewhere else. 30°
+        // would not — which is the angle the old tests happened to use.
+        let turn = std::f32::consts::PI / 12.0;
+        let hex_turned = hex_poly(40.0, turn);
+        let chev_both = chevron_poly([70.0, 30.0], 18.0, 26.0);
+        let chev_right = chevron_poly([70.0, 30.0], 0.0, 26.0);
+        // The band's outer edge meets the SHORTER side of the rect, so
+        // its axis sits one half thickness inside that.
+        let cut = arc_curve(60.0 - 7.0, 0.6, 0.9);
+        let closed = arc_curve(60.0 - 7.0, std::f32::consts::PI, 0.0);
+        let oblong = arc_curve(40.0 - 7.0, 0.6, -0.5);
+
+        type Truth<'t> = Box<dyn Fn([f32; 2]) -> f32 + 't>;
+        fn poly(p: &[[f32; 2]]) -> Truth<'_> {
+            Box::new(move |q| poly_sd(p, q))
+        }
+        fn band(c: &[[f32; 2]], rb: f32) -> Truth<'_> {
+            Box::new(move |q| curve_dist(c, q) - rb)
+        }
+        let zero = [0.0f32; 4];
+        let cases: Vec<(&str, Record, Truth, bool)> = vec![
+            (
+                "box",
+                Record { half: [60.0, 36.0], corner: zero, flags: flags(0, [0; 4]), arc_half: 0.0, arc_dir: 0.0 },
+                poly(&sq),
+                true,
+            ),
+            (
+                "rounded box",
+                Record { half: [60.0, 36.0], corner: [14.0; 4], flags: flags(0, [1; 4]), arc_half: 0.0, arc_dir: 0.0 },
+                poly(&rn),
+                true,
+            ),
+            (
+                "chamfered box",
+                Record { half: [60.0, 36.0], corner: [12.0; 4], flags: flags(0, [2; 4]), arc_half: 0.0, arc_dir: 0.0 },
+                poly(&ch),
+                false,
+            ),
+            (
+                "four corners that differ",
+                Record { half: [60.0, 36.0], corner: [14.0, 12.0, 0.0, 6.0], flags: flags(0, [1, 2, 0, 1]), arc_half: 0.0, arc_dir: 0.0 },
+                poly(&mx),
+                false,
+            ),
+            (
+                "hexagon, flat top",
+                Record { half: [50.0, 50.0], corner: [40.0, 0.0, 0.0, 0.0], flags: flags(2, [0; 4]), arc_half: 0.0, arc_dir: 0.0 },
+                poly(&hex_flat),
+                true,
+            ),
+            (
+                "hexagon turned 15 degrees",
+                Record { half: [50.0, 50.0], corner: [40.0, 0.0, 0.0, 0.0], flags: flags(2, [0; 4]), arc_half: 0.0, arc_dir: turn },
+                poly(&hex_turned),
+                true,
+            ),
+            (
+                "chevron, both ends",
+                Record { half: [70.0, 30.0], corner: [18.0, 26.0, 0.0, 0.0], flags: flags(3, [0; 4]), arc_half: 0.0, arc_dir: 0.0 },
+                poly(&chev_both),
+                false,
+            ),
+            (
+                "chevron, one end",
+                Record { half: [70.0, 30.0], corner: [0.0, 26.0, 0.0, 0.0], flags: flags(3, [0; 4]), arc_half: 0.0, arc_dir: 0.0 },
+                poly(&chev_right),
+                false,
+            ),
+            (
+                "arc, cut short and turned",
+                Record { half: [60.0, 60.0], corner: [7.0, 0.0, 0.0, 0.0], flags: flags(1, [0; 4]), arc_half: 0.6, arc_dir: 0.9 },
+                band(&cut, 7.0),
+                true,
+            ),
+            (
+                "arc, closed",
+                Record { half: [60.0, 60.0], corner: [7.0, 0.0, 0.0, 0.0], flags: flags(1, [0; 4]), arc_half: std::f32::consts::PI, arc_dir: 0.0 },
+                band(&closed, 7.0),
+                true,
+            ),
+            (
+                "arc in an oblong rect",
+                Record { half: [80.0, 40.0], corner: [7.0, 0.0, 0.0, 0.0], flags: flags(1, [0; 4]), arc_half: 0.6, arc_dir: -0.5 },
+                band(&oblong, 7.0),
+                true,
+            ),
+        ];
+
+        const N: i32 = 60;
+        // The polylines above are inscribed, so the reference reads a
+        // hair long; every one of them is fine enough that the hair is
+        // under a thousandth of a pixel. This is two orders past that.
+        const TOL: f32 = 0.05;
+        // A dead band around the boundary, where a float either side is
+        // neither an error nor a signal.
+        const SKIN: f32 = 0.02;
+
+        for (name, rec, truth, exact) in cases {
+            let (mut inside, mut outside, mut worst) = (0usize, 0usize, 0.0f32);
+            for iy in -N..=N {
+                for ix in -N..=N {
+                    let p = [
+                        rec.half[0] * 1.7 * ix as f32 / N as f32,
+                        rec.half[1] * 1.7 * iy as f32 / N as f32,
+                    ];
+                    let want = truth(p);
+                    let got = field.at(rec, p);
+                    if want.abs() > SKIN {
+                        assert_eq!(
+                            want < 0.0,
+                            got < 0.0,
+                            "{name}: {p:?} is {} by the outline and {} by the shader ({want} vs {got})",
+                            if want < 0.0 { "inside" } else { "outside" },
+                            if got < 0.0 { "inside" } else { "outside" }
+                        );
+                    }
+                    if want < 0.0 {
+                        inside += 1;
+                    } else {
+                        outside += 1;
+                    }
+                    if exact || want <= -SKIN {
+                        worst = worst.max((got - want).abs());
+                        assert!(
+                            (got - want).abs() <= TOL,
+                            "{name}: at {p:?} the outline is {want} away and the field says {got}"
+                        );
+                    }
+                }
+            }
+            // Fail closed: a silhouette nobody landed inside proves
+            // nothing about its interior, and one nobody landed outside
+            // proves nothing at all.
+            assert!(inside >= 100 && outside >= 100, "{name}: {inside} in, {outside} out");
+            assert!(worst > 0.0, "{name}: not one sample was compared by number");
+        }
+    }
+
+    /// **The shader against the SPECIFICATION itself.**
+    ///
+    /// The test above holds the field to silhouettes stated as
+    /// GEOMETRY, which is the check that cannot agree by accident. This
+    /// is the other end of the same contract, and it is the one both
+    /// file headers have been promising since K3: `nacelle::sdf` says
+    /// the shader is the implementation and that file the
+    /// specification, "a change to one without the other is wrong by
+    /// definition" — and until the lock was bumped past K6 nothing in
+    /// this crate could call it to find out. `shape_field.rs` says so
+    /// too, in as many words, and names this as the check worth taking
+    /// once the merge order had run.
+    ///
+    /// So it is taken. The WGSL runs over naga's IR and
+    /// `nacelle::sdf::d_record` runs over the same records at the same
+    /// points, and the two must answer the same number. The tolerance
+    /// is float noise and nothing else: both evaluate the same products
+    /// in the same order, so a disagreement here is one of SUBSTANCE —
+    /// a sign, a slot, the sense of a rotation — not of rounding. It is
+    /// not even being spent: across the whole table the largest
+    /// difference measured is ZERO, bit for bit, which is what "line for
+    /// line" turns out to mean when both sides are f32 and neither
+    /// reorders a sum. The tolerance is there for the day a compiler
+    /// contracts a multiply-add on one side only.
+    ///
+    /// It also settles the one thing geometry cannot: that the kind
+    /// CODES agree. The records are built through `ShapeKind::code()`
+    /// rather than through 1, 2, 3, so a renumbering on the toolkit's
+    /// side fails here instead of drawing hexagons where arcs were
+    /// asked for. `Capsule` is in the table for the same reason from
+    /// the other direction — it is a code the shader does NOT single
+    /// out, and both sides must fall back to the Box family for it.
+    #[test]
+    fn the_field_answers_what_the_reference_answers() {
+        use nacelle::draw::{Shape, ShapeKind};
+        let module =
+            naga::front::wgsl::parse_str(super::WGSL_SRC).expect("the shader must parse");
+        let mut field = crate::shape_field::Field::new(&module, "shape_field");
+
+        // The record as the toolkit packs it: the kind's code in bits
+        // 8-11, the corner treatments in bits 0-7, the angles in their
+        // own slots (`draw::kind_angles`, private, so it is spelled out
+        // here) and the lengths already in `corner`.
+        let rec = |half: [f32; 2], corner: [f32; 4], kind: ShapeKind, styles: [u32; 4]| {
+            let (arc_half, arc_dir) = match kind {
+                ShapeKind::Ring { half_sweep, dir, .. } => (half_sweep.max(0.0), dir),
+                ShapeKind::Hex { turn } => (0.0, turn),
+                _ => (0.0, 0.0),
+            };
+            Shape {
+                half,
+                stroke: 0.0,
+                feather: 0.0,
+                corner,
+                stroke_c: [0.0; 4],
+                flags: (kind.code() << Shape::KIND_SHIFT)
+                    | styles.iter().enumerate().fold(0, |f, (i, s)| f | (s << (2 * i))),
+                arc_half,
+                arc_dir,
+                _pad: 0.0,
+                tint: [0.0; 4],
+            }
+        };
+        let pi = std::f32::consts::PI;
+        let cases = [
+            ("box", rec([60.0, 36.0], [0.0; 4], ShapeKind::Box, [0; 4])),
+            ("rounded box", rec([60.0, 36.0], [14.0; 4], ShapeKind::Box, [1; 4])),
+            ("chamfered box", rec([60.0, 36.0], [12.0; 4], ShapeKind::Box, [2; 4])),
+            (
+                "four corners that differ",
+                rec([60.0, 36.0], [14.0, 12.0, 0.0, 6.0], ShapeKind::Box, [1, 2, 0, 1]),
+            ),
+            (
+                "capsule, a code neither side singles out",
+                rec([60.0, 36.0], [10.0; 4], ShapeKind::Capsule, [1; 4]),
+            ),
+            (
+                "arc, cut short and turned",
+                rec(
+                    [60.0, 60.0],
+                    [7.0, 0.0, 0.0, 0.0],
+                    ShapeKind::Ring { width: 14.0, half_sweep: 0.6, dir: 0.9 },
+                    [0; 4],
+                ),
+            ),
+            (
+                "arc, closed",
+                rec(
+                    [60.0, 60.0],
+                    [7.0, 0.0, 0.0, 0.0],
+                    ShapeKind::Ring { width: 14.0, half_sweep: pi, dir: 0.0 },
+                    [0; 4],
+                ),
+            ),
+            (
+                "arc in an oblong rect",
+                rec(
+                    [80.0, 40.0],
+                    [7.0, 0.0, 0.0, 0.0],
+                    ShapeKind::Ring { width: 14.0, half_sweep: 0.6, dir: -0.5 },
+                    [0; 4],
+                ),
+            ),
+            (
+                "hexagon, flat top",
+                rec([50.0, 50.0], [40.0, 0.0, 0.0, 0.0], ShapeKind::Hex { turn: 0.0 }, [0; 4]),
+            ),
+            (
+                "hexagon turned 15 degrees",
+                rec(
+                    [50.0, 50.0],
+                    [40.0, 0.0, 0.0, 0.0],
+                    ShapeKind::Hex { turn: pi / 12.0 },
+                    [0; 4],
+                ),
+            ),
+            (
+                "chevron, both ends",
+                rec(
+                    [70.0, 30.0],
+                    [18.0, 26.0, 0.0, 0.0],
+                    ShapeKind::Chevron { left: 18.0, right: 26.0 },
+                    [0; 4],
+                ),
+            ),
+            (
+                "chevron, one end",
+                rec(
+                    [70.0, 30.0],
+                    [0.0, 26.0, 0.0, 0.0],
+                    ShapeKind::Chevron { left: 0.0, right: 26.0 },
+                    [0; 4],
+                ),
+            ),
+        ];
+
+        const N: i32 = 40;
+        // Two implementations of one formula, so this is the width of a
+        // float's shrug over distances of a hundred pixels and not a
+        // budget for disagreement.
+        const TOL: f32 = 1e-3;
+        let mut compared = 0usize;
+        let mut worst = 0.0f32;
+        for (name, s) in cases {
+            for iy in -N..=N {
+                for ix in -N..=N {
+                    let p = [
+                        s.half[0] * 1.7 * ix as f32 / N as f32,
+                        s.half[1] * 1.7 * iy as f32 / N as f32,
+                    ];
+                    let want = nacelle::sdf::d_record(&s, p);
+                    let got = field.at(
+                        crate::shape_field::Record {
+                            half: s.half,
+                            corner: s.corner,
+                            flags: s.flags,
+                            arc_half: s.arc_half,
+                            arc_dir: s.arc_dir,
+                        },
+                        p,
+                    );
+                    assert!(
+                        (got - want).abs() <= TOL,
+                        "{name}: at {p:?} the reference says {want} and the shader says {got}"
+                    );
+                    worst = worst.max((got - want).abs());
+                    compared += 1;
+                }
+            }
+        }
+        // Fail closed: a table that compared nothing proves nothing.
+        assert_eq!(compared, 12 * (2 * N as usize + 1).pow(2));
+        assert!(worst.is_finite(), "the field answered a NaN somewhere");
     }
 
     /// **Why f3 K4 cost this crate nothing.** The diagonal lane — every
