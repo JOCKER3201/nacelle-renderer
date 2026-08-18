@@ -749,6 +749,29 @@ impl Gfx {
         }
     }
 
+    /// The bit depth the swapchain ACTUALLY carries, which is not always
+    /// the one that was asked for: [`Gfx::set_color_depth`] states a
+    /// wish and the surface answers with whatever formats it has.
+    ///
+    /// Read rather than remembered, so it cannot drift from the picture:
+    /// the number comes off `self.format`, the same field the images and
+    /// the render pass were built from. Valid from the first frame — the
+    /// constructor builds a swapchain before it hands the `Gfx` back —
+    /// and it moves at the rebuild, not at the request, so a caller that
+    /// asks in the same breath as it sets still gets the OLD answer.
+    ///
+    /// THE REBUILD IS INSIDE [`Gfx::render`], which is the whole of what
+    /// a caller has to know: ask AFTER a frame has been drawn, never
+    /// between setting the depth and drawing. The desktop's settings
+    /// window reads it on the line following its `draw_screen`, and
+    /// treats the gap between the request and that read as "not
+    /// measured" rather than as an answer — a wish paired with the
+    /// depth of the format being replaced reads as a shortfall the
+    /// surface was never asked about.
+    pub fn color_depth(&self) -> u32 {
+        format_bits(self.format.format)
+    }
+
     /// The theme's glyph-coverage exponent (render.text_gamma). Clamped to
     /// the token's own stated range; 0 (the engine's kind fallback when no
     /// theme declares it) means identity.
@@ -2810,6 +2833,26 @@ fn pick_format(formats: &[vk::SurfaceFormatKHR], depth: u32) -> vk::SurfaceForma
     formats[0]
 }
 
+/// How many bits per colour channel a swapchain format really carries.
+///
+/// The counterpart of [`pick_format`], and the reason it exists: that
+/// function ASKS, and a surface is free to answer with less. A settings
+/// page which only ever showed the number that was asked for would say
+/// "16" over a picture the driver is handing back in eight — and a user
+/// looking for the difference between the two would find none, with
+/// nothing anywhere to tell them why.
+///
+/// Sixteen-bit float is reported as sixteen even though the twelve the
+/// page may have asked for rides in it; twelve is a wish about the wire
+/// and this is a statement about the buffer.
+fn format_bits(f: vk::Format) -> u32 {
+    match f {
+        vk::Format::R16G16B16A16_SFLOAT | vk::Format::R16G16B16A16_UNORM => 16,
+        vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32 => 10,
+        _ => 8,
+    }
+}
+
 fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
@@ -2877,8 +2920,8 @@ fn create_host_buffer(
 #[cfg(test)]
 mod tests {
     use super::{
-        glass_rank, glass_target, is_glass, parse_cube, pipe_of, pyramid_steps, run_kind,
-        scissor_for, Pipe, RunKind,
+        format_bits, glass_rank, glass_target, is_glass, parse_cube, pick_format, pipe_of,
+        pyramid_steps, run_kind, scissor_for, vk, Pipe, RunKind,
     };
     use nacelle::draw::{
         ImageId, ADD_ATLAS, BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3, SHAPE,
@@ -3144,5 +3187,60 @@ mod tests {
         assert!(parse_cube("LUT_1D_SIZE 2\n0 0 0\n1 1 1\n").is_none());
         // Rubbish is rubbish.
         assert!(parse_cube("not a lut at all").is_none());
+    }
+
+    /// A depth chosen in the settings window asks for a DIFFERENT
+    /// surface format, and what comes back is reported as the depth it
+    /// really is.
+    ///
+    /// Two halves of one honesty. The first is the request: a swapchain
+    /// rebuild only happens because `pick_format` answered something
+    /// other than the format in force, so a preference that mapped to
+    /// the same format for every number would be a control with nothing
+    /// behind it. The second is the answer: a surface offering nothing
+    /// but eight bits gives eight whatever was asked, and the number the
+    /// page shows has to be the one in the buffer — otherwise the window
+    /// says "16" over a picture that is not sixteen and the user hunts
+    /// for a difference that was never rendered.
+    ///
+    /// What this CANNOT check without a device: that the driver then
+    /// hands those bits to the wire. Twelve rides in a sixteen-bit float
+    /// buffer and what the cable carries is between the compositor and
+    /// the display; nothing in this process can see it.
+    #[test]
+    fn a_depth_asks_for_a_format_and_the_answer_is_reported_as_it_is() {
+        let srgb = vk::ColorSpaceKHR::SRGB_NONLINEAR;
+        let sf = |format| vk::SurfaceFormatKHR { format, color_space: srgb };
+
+        // A surface with the whole ladder on it: every step is reachable
+        // and every step is a different format, which is what makes the
+        // rebuild fire.
+        let rich = [
+            sf(vk::Format::B8G8R8A8_UNORM),
+            sf(vk::Format::A2B10G10R10_UNORM_PACK32),
+            sf(vk::Format::R16G16B16A16_SFLOAT),
+        ];
+        assert_eq!(format_bits(pick_format(&rich, 8).format), 8);
+        assert_eq!(format_bits(pick_format(&rich, 10).format), 10);
+        assert_eq!(format_bits(pick_format(&rich, 16).format), 16);
+        // Twelve has no swapchain of its own and rides the float one.
+        assert_eq!(format_bits(pick_format(&rich, 12).format), 16);
+        assert_ne!(
+            pick_format(&rich, 8).format,
+            pick_format(&rich, 10).format,
+            "two depths that picked one format would never rebuild anything"
+        );
+
+        // And the honest half: a surface that offers eight and nothing
+        // else answers eight to every wish.
+        let poor = [sf(vk::Format::B8G8R8A8_UNORM)];
+        for asked in [8, 10, 12, 16] {
+            assert_eq!(
+                format_bits(pick_format(&poor, asked).format),
+                8,
+                "asked for {asked} bits over an eight-bit surface and the \
+                 number reported was not the one in the buffer"
+            );
+        }
     }
 }
