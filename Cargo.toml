@@ -30,3 +30,12 @@ naga = { version = "0.19", features = ["wgsl-in", "spv-out"] }
 # by hand into the file whose whole job is to report exact numbers.
 # License: Apache-2.0 (gfx-rs/rspirv) — on the project's allowed list.
 spirv = "0.3"
+
+# TEMPORARY, for the duration of the feat/vector-glow branch only.
+# SHAPE_ADD and the soft flag bits live in libnacelle and this crate
+# reads them; the pin above cannot name a commit that has not been
+# pushed, so the sibling worktree stands in until the merge order runs
+# (libnacelle, then the pin, then this crate). MUST be removed and the
+# lock re-pinned before this branch is merged.
+[patch."https://github.com/JOCKER3201/libnacelle"]
+libnacelle = { path = "../libnacelle" }

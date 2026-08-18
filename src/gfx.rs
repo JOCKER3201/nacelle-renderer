@@ -1,12 +1,15 @@
-//! Vulkan renderer (ash) — five pipelines over one vertex stream: the
+//! Vulkan renderer (ash) — six pipelines over one vertex stream: the
 //! atlas one (text and solid shapes, R8 coverage), the image one
 //! (application-registered RGBA textures), the frosted-glass one (the
 //! scene beneath, pre-rendered and blurred, sampled at one of three
 //! pyramid ranks), the additive one (fs_main again under
 //! SRC_ALPHA/ONE, so glow adds light instead of filming over it) and
 //! the shape one (the vector core: an analytic distance field over
-//! set 2's records, one quad per silhouette). The draw list's runs say
-//! which is which, in emission order, each run under its own scissor.
+//! set 2's records, one quad per silhouette) and its ADDITIVE twin,
+//! which is the same fragment under the same blend the atlas glow
+//! uses — because a glow adds light and that is a property of the
+//! pipeline, not of the record. The draw list's runs say which is
+//! which, in emission order, each run under its own scissor.
 
 use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
@@ -1512,7 +1515,9 @@ impl Gfx {
                     // fs_shape samples nothing from set 0, but the
                     // shared layout demands one bound; the atlas set is
                     // always alive.
-                    RunKind::Atlas | RunKind::Add | RunKind::Shape => self.desc_set,
+                    RunKind::Atlas | RunKind::Add | RunKind::Shape | RunKind::ShapeAdd => {
+                        self.desc_set
+                    }
                     // A frosted band reads the pyramid like glass, so it
                     // binds what glass binds — the pipeline it draws
                     // with is the one that ALSO reads set 2.
@@ -2177,6 +2182,9 @@ enum RunKind {
     Add,
     /// The vector core: fs_shape over the set-2 records.
     Shape,
+    /// The vector core's ADDITIVE lane: the same fragment, the same
+    /// records, SRC_ALPHA/ONE. A glow (f3 §2.6) and nothing else.
+    ShapeAdd,
     /// The vector core's FROSTED band (f3 §3.3): fs_shape_glass over
     /// the set-2 records AND the pyramid target the run's rank resolves
     /// to. The one kind that reads both.
@@ -2191,6 +2199,7 @@ fn run_kind(image: Option<ImageId>, blur_depth: u32) -> RunKind {
         None => RunKind::Atlas,
         Some(id) if id == nacelle::draw::ADD_ATLAS => RunKind::Add,
         Some(id) if id == nacelle::draw::SHAPE => RunKind::Shape,
+        Some(id) if id == nacelle::draw::SHAPE_ADD => RunKind::ShapeAdd,
         Some(id) if is_shape_glass(id) => {
             RunKind::ShapeGlass(glass_target(glass_rank(id), blur_depth))
         }
@@ -2241,11 +2250,20 @@ enum Pipe {
     /// the one pipeline that binds a pyramid target AND reads the shape
     /// records (f3 §3.3, K3b). Dead behind the same switch.
     ShapeGlass = 5,
+    /// fs_shape under SRC_ALPHA/ONE colour, ZERO/ONE alpha: the vector
+    /// core's glow (f3 §2.6). Same fragment, same stage array and same
+    /// set as `Shape` — the ONE thing that differs is the blend, which
+    /// is why it has to be a pipeline of its own and could not have
+    /// been a bit in the record: blend state is fixed before the first
+    /// fragment of a run is shaded. Its blend is `Add`'s, to the
+    /// factor, so a glow composes with light exactly as the atlas glow
+    /// it replaces did.
+    ShapeAdd = 6,
 }
 
 impl Pipe {
     /// How many there are — the length of every array indexed by one.
-    const N: usize = 6;
+    const N: usize = 7;
 }
 
 /// Which pipeline draws a run of this kind.
@@ -2261,6 +2279,7 @@ fn pipe_of(kind: RunKind) -> Pipe {
         RunKind::Atlas => Pipe::Atlas,
         RunKind::Add => Pipe::Add,
         RunKind::Shape => Pipe::Shape,
+        RunKind::ShapeAdd => Pipe::ShapeAdd,
         RunKind::ShapeGlass(_) => Pipe::ShapeGlass,
         RunKind::Glass(_) => Pipe::Blur,
         RunKind::Image(_) => Pipe::Image,
@@ -2382,7 +2401,7 @@ fn create_blur_pass(device: &ash::Device, format: vk::Format) -> vk::RenderPass 
 /// and the two passes match.
 struct Pipelines {
     layout: vk::PipelineLayout,
-    /// The six handles indexed by [`Pipe`] — what each one draws is
+    /// The seven handles indexed by [`Pipe`] — what each one draws is
     /// written at the enum, once, rather than beside every field that
     /// would otherwise hold it. The create-infos below are filled in at
     /// the index their own name resolves to, so this array and every
@@ -2399,8 +2418,8 @@ fn create_pipeline(
 ) -> Pipelines {
     unsafe {
         // One SPIR-V module, one vertex stage, four fragment entry
-        // points; the additive pipeline reuses fs_main and differs only
-        // in blend state.
+        // points; the two additive pipelines reuse fs_main and fs_shape
+        // and differ from their twins only in blend state.
         let spv = crate::shaders::compile();
         let shader_mod = device
             .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)
@@ -2610,6 +2629,21 @@ fn create_pipeline(
             .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
+        // The glow's pipeline: `stages_shape` again, `blend_add` again
+        // — the two arrays that already exist, paired for the first
+        // time. Nothing new is compiled and nothing new is written.
+        let info_shape_add = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages_shape)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend_add)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
         let info_shape = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages_shape)
             .vertex_input_state(&vertex_input)
@@ -2636,6 +2670,7 @@ fn create_pipeline(
         infos[Pipe::Add as usize] = info_add;
         infos[Pipe::Shape as usize] = info_shape;
         infos[Pipe::ShapeGlass as usize] = info_shape_glass;
+        infos[Pipe::ShapeAdd as usize] = info_shape_add;
         let pipelines = device
             .create_graphics_pipelines(vk::PipelineCache::null(), &infos, None)
             .expect("cannot create pipelines");
@@ -2847,7 +2882,7 @@ mod tests {
     };
     use nacelle::draw::{
         ImageId, ADD_ATLAS, BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3, SHAPE,
-        SHAPE_GLASS_1, SHAPE_GLASS_2, SHAPE_GLASS_3,
+        SHAPE_ADD, SHAPE_GLASS_1, SHAPE_GLASS_2, SHAPE_GLASS_3,
     };
 
     /// The base-scene split triggers on glass and only on glass: the
@@ -2891,6 +2926,7 @@ mod tests {
         assert_eq!(pipe_of(RunKind::Atlas), Pipe::Atlas);
         assert_eq!(pipe_of(RunKind::Add), Pipe::Add);
         assert_eq!(pipe_of(RunKind::Shape), Pipe::Shape);
+        assert_eq!(pipe_of(RunKind::ShapeAdd), Pipe::ShapeAdd);
         assert_eq!(pipe_of(RunKind::Image(7)), Pipe::Image);
         for t in 0..3 {
             assert_eq!(pipe_of(RunKind::Glass(t)), Pipe::Blur);
@@ -2902,11 +2938,25 @@ mod tests {
         assert_eq!(pipe_of(run_kind(Some(SHAPE_GLASS_2), 3)), Pipe::ShapeGlass);
         assert_eq!(pipe_of(run_kind(Some(GLASS_RANK_2), 3)), Pipe::Blur);
         assert_eq!(pipe_of(run_kind(Some(SHAPE), 3)), Pipe::Shape);
+        // The glow's lane, and the pairing that makes it one: the same
+        // fragment as `Shape`, a different blend. Sent down `Shape` it
+        // would draw a correct glow that COVERS instead of lighting —
+        // a milky rectangle over whatever it was meant to brighten.
+        assert_eq!(pipe_of(run_kind(Some(SHAPE_ADD), 3)), Pipe::ShapeAdd);
+        assert_ne!(Pipe::ShapeAdd as usize, Pipe::Shape as usize);
         assert_eq!(pipe_of(run_kind(None, 3)), Pipe::Atlas);
         // The names index an array, so two of them sharing a slot would
         // bind one pipeline for two kinds — silently, and only on the
         // lane that lost.
-        let all = [Pipe::Atlas, Pipe::Image, Pipe::Blur, Pipe::Add, Pipe::Shape, Pipe::ShapeGlass];
+        let all = [
+            Pipe::Atlas,
+            Pipe::Image,
+            Pipe::Blur,
+            Pipe::Add,
+            Pipe::Shape,
+            Pipe::ShapeGlass,
+            Pipe::ShapeAdd,
+        ];
         let mut slots: Vec<usize> = all.iter().map(|p| *p as usize).collect();
         slots.sort_unstable();
         assert_eq!(slots, (0..Pipe::N).collect::<Vec<_>>());
@@ -3007,6 +3057,7 @@ mod tests {
         assert_eq!(run_kind(Some(ADD_ATLAS), 3), RunKind::Add);
         assert_eq!(run_kind(Some(SHAPE), 3), RunKind::Shape);
         assert_eq!(run_kind(Some(SHAPE), 1), RunKind::Shape);
+        assert_eq!(run_kind(Some(SHAPE_ADD), 3), RunKind::ShapeAdd);
         assert_eq!(run_kind(Some(BLUR_IMAGE), 3), RunKind::Glass(2));
         assert_eq!(run_kind(Some(BLUR_IMAGE), 1), RunKind::Glass(1));
         assert_eq!(run_kind(Some(GLASS_RANK_1), 3), RunKind::Glass(1));
@@ -3023,9 +3074,13 @@ mod tests {
         assert_eq!(run_kind(Some(SHAPE_GLASS_3), 3), RunKind::ShapeGlass(3));
         assert_eq!(run_kind(Some(SHAPE_GLASS_3), 1), RunKind::ShapeGlass(1));
         assert_eq!(run_kind(Some(ImageId(7)), 3), RunKind::Image(7));
+        // The reserved band still holds unclaimed handles, and one of
+        // them still has to classify as an image and die on the
+        // missing-texture fail-safe. `u32::MAX - 9` used to be the
+        // spare; the glow took it, so the assertion moves down one.
         assert_eq!(
-            run_kind(Some(ImageId(u32::MAX - 9)), 3),
-            RunKind::Image(u32::MAX - 9)
+            run_kind(Some(ImageId(u32::MAX - 10)), 3),
+            RunKind::Image(u32::MAX - 10)
         );
     }
 

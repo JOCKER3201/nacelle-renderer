@@ -272,6 +272,39 @@ fn shape_field(
     return d;
 }
 
+// The coverage ONE record puts on a fragment at signed distance `d`
+// under AA width `w`: the crisp ramp of 2.3, or 2.6's gaussian profile
+// when bit 15 (GAUSS) says so, masked to the OUTSIDE when bit 14
+// (OUTSIDE_ONLY) does. The mirror of `nacelle::sdf::shape_alpha`.
+//
+// It TAKES the width instead of computing it, and that is the whole
+// reason it is a function of its own: no derivative appears inside, so
+// the crate's WGSL interpreter can run it against the reference
+// without a GPU — the same trick that made `shape_field` checkable.
+// `the_soft_profile_answers_what_the_reference_answers` is the check.
+fn shape_alpha(d: f32, w: f32, feather: f32, flags: u32) -> f32 {
+    // Sigma is a third of the reach, and the tail is cut at the reach:
+    // exactly `FontSystem::bake_masks` (font.rs:471-484), which is what
+    // every glow and shadow drawn off the ATLAS lane already samples.
+    // Two lanes, one profile — otherwise the same theme would draw two
+    // different glows depending on a switch nobody sees.
+    let sg = max(feather, 1e-6) / 3.0;
+    let x = max(d, 0.0);
+    let soft = select(0.0, exp(-(x * x) / (2.0 * sg * sg)), d < feather);
+    let crisp = clamp(0.5 - d / w, 0.0, 1.0);
+    // ONE coverage, never a product of two softnesses: 2.6 forbids
+    // weighting the profile by the ramp of the same edge, which would
+    // dim the boundary twice and leave a dark hairline all round.
+    let a = select(crisp, soft, ((flags >> 15u) & 1u) == 1u);
+    // The outside mask is not a second softness — it is the AREA of
+    // the pixel the silhouette leaves, the exact complement of `crisp`
+    // and exactly 1 half a pixel out. A glow lights what is around a
+    // shape; the boundary pixel the panel half-covers takes its other
+    // half from here, and the two add up instead of leaving a seam.
+    let outside = clamp(0.5 + d / w, 0.0, 1.0);
+    return a * select(1.0, outside, ((flags >> 14u) & 1u) == 1u);
+}
+
 // Coverage of the silhouette (x) and area of the inward band (y).
 // Called from the top level of an entry point and from nowhere else:
 // the derivatives below need uniform control flow.
@@ -282,7 +315,7 @@ fn shape_cover(s: Shape, d: f32) -> vec2<f32> {
     // sqrt(2) on a 45-degree slope (f3 2.3).
     let g = vec2<f32>(dpdx(d), dpdy(d));
     let w = max(length(g), 1e-6);
-    let cov = clamp(0.5 - d / w, 0.0, 1.0);
+    let cov = shape_alpha(d, w, s.feather, s.flags);
 
     // The stroke band, INWARD from the boundary (the project's
     // convention), as an AREA: the interior LESS the interior inset by
@@ -291,9 +324,16 @@ fn shape_cover(s: Shape, d: f32) -> vec2<f32> {
     // by itself puts 0.25 on an edge whose area is 0.5, and keeps
     // reading a half at the centre of a hairline however thin it gets.
     // The mirror of `nacelle::sdf::band_coverage`.
+    //
+    // The outer ramp is written out again rather than reusing `cov`
+    // above: since the soft profiles landed, `cov` is only the crisp
+    // ramp on a crisp record, and a band is a crisp thing whatever the
+    // fill is. The toolkit never writes STROKE beside GAUSS — it
+    // asserts against it — so this cannot fire today; it is written to
+    // be right on the day something does.
     let has_stroke = f32((s.flags >> 13u) & 1u);
     let cov_in = clamp(0.5 - (d + s.stroke) / w, 0.0, 1.0);
-    let a_band = max(cov - cov_in, 0.0) * has_stroke;
+    let a_band = max(clamp(0.5 - d / w, 0.0, 1.0) - cov_in, 0.0) * has_stroke;
     return vec2<f32>(cov, a_band);
 }
 
@@ -494,7 +534,9 @@ mod tests {
         );
         // The difference of ramps, and the area composition it feeds.
         assert!(src.contains("let cov_in = clamp(0.5 - (d + s.stroke) / w, 0.0, 1.0);"));
-        assert!(src.contains("let a_band = max(cov - cov_in, 0.0) * has_stroke;"));
+        assert!(src.contains(
+            "let a_band = max(clamp(0.5 - d / w, 0.0, 1.0) - cov_in, 0.0) * has_stroke;"
+        ));
         assert!(src.contains("let alpha = cov * f_a + s_a * (1.0 - f_a);"));
         assert!(src.contains("let g = vec2<f32>(dpdx(d), dpdy(d));"));
         // The two gates the composition stands on. `has_fill` is the
@@ -523,6 +565,30 @@ mod tests {
         assert_eq!(src.matches("shape_field(p, s.half_size,").count(), 2, "an entry point grew its own field");
         assert_eq!(src.matches("dpdx(d)").count(), 1);
         assert_eq!(src.matches("let alpha = cov * f_a + s_a * (1.0 - f_a);").count(), 1);
+        // The soft profiles' own gates, and the same discipline: ONE
+        // copy of the branch, in a function with no derivative in it so
+        // it can be RUN (`the_soft_profile_answers_what_the_reference_
+        // answers`). Bit 14 is the glow's mask and bit 15 the gaussian;
+        // both are read here and nowhere else.
+        assert_eq!(src.matches("fn shape_alpha(").count(), 1);
+        assert_eq!(src.matches("shape_alpha(d, w, s.feather, s.flags)").count(), 1);
+        assert!(src.contains("((flags >> 14u) & 1u) == 1u"), "OUTSIDE_ONLY lost its reader");
+        assert!(src.contains("((flags >> 15u) & 1u) == 1u"), "GAUSS lost its reader");
+        // The mask is the pixel's own AREA, not a step: the complement
+        // of the crisp ramp. A `select(0.0, 1.0, d >= 0.0)` here would
+        // compile, would look right on a screenshot of a glow alone,
+        // and would draw a hard stair against every panel standing on
+        // one — which is the one edge this lane exists to smooth.
+        assert!(
+            src.contains("let outside = clamp(0.5 + d / w, 0.0, 1.0);"),
+            "the outside mask stopped being an area"
+        );
+        // And the profile is bake_masks' own: sigma a third of the
+        // reach, hard zero at the reach. Anything else and the atlas
+        // lane and the field lane draw two different glows off one
+        // theme (nacelle::sdf::soft_profile carries the derivation).
+        assert!(src.contains("let sg = max(feather, 1e-6) / 3.0;"));
+        assert!(src.contains("select(0.0, exp(-(x * x) / (2.0 * sg * sg)), d < feather)"));
     }
 
     /// The FROSTED entry point's own contract (f3 §3.3), and every line
@@ -966,6 +1032,32 @@ mod tests {
                     [0; 4],
                 ),
             ),
+            // The soft records (f3 §2.6). They are here to prove a
+            // NEGATIVE the compiler cannot: the silhouette is decided
+            // by bits 0-11 and by nothing else, so bits 14-15 and
+            // `feather` must leave the field untouched. Both sides mask
+            // the kind with `0xF` — the SECOND record is the one that
+            // makes that a claim rather than a coincidence, because a
+            // mask widened past four bits swallows bit 14 and 15 and
+            // turns its hexagon back into a box, while every Box case
+            // in this table would go on passing.
+            ("a glow around a rounded panel", {
+                let mut s = rec([90.0, 55.0], [16.0; 4], ShapeKind::Box, [1; 4]);
+                s.feather = 11.0;
+                s.flags |= Shape::GAUSS | Shape::OUTSIDE_ONLY;
+                s
+            }),
+            ("a shadow under a hexagon", {
+                let mut s = rec(
+                    [50.0, 50.0],
+                    [40.0, 0.0, 0.0, 0.0],
+                    ShapeKind::Hex { turn: 0.0 },
+                    [0; 4],
+                );
+                s.feather = 21.0;
+                s.flags |= Shape::GAUSS;
+                s
+            }),
         ];
 
         const N: i32 = 40;
@@ -1003,8 +1095,81 @@ mod tests {
             }
         }
         // Fail closed: a table that compared nothing proves nothing.
-        assert_eq!(compared, 12 * (2 * N as usize + 1).pow(2));
+        assert_eq!(compared, 14 * (2 * N as usize + 1).pow(2));
         assert!(worst.is_finite(), "the field answered a NaN somewhere");
+    }
+
+    /// **The soft profile against the specification, run rather than
+    /// read** (f3 §2.6).
+    ///
+    /// The test above does this for the SILHOUETTE; this is the other
+    /// half of the fragment, and it exists because the half that had no
+    /// executable check is the half that would have been checked by
+    /// quoting lines of text — which is exactly the weakness
+    /// `shape_field.rs` was written to end. `shape_alpha` takes the AA
+    /// width as an argument instead of asking for a derivative, so the
+    /// interpreter can call it; that is the only reason it is a
+    /// function at all.
+    ///
+    /// Four flag combinations over a sweep that straddles the boundary
+    /// and runs past the reach, at four AA widths — including a wide
+    /// one, because a ride widens the ramp in local units and the
+    /// outside mask is the one term that reads `w` on a soft record.
+    ///
+    /// The tolerance is float noise: both sides evaluate one formula in
+    /// f32 in the same order. `exp` is the one function here whose last
+    /// bit is not pinned by IEEE 754, which is why this is not asserted
+    /// bit for bit the way `d_record` is.
+    #[test]
+    fn the_soft_profile_answers_what_the_reference_answers() {
+        use nacelle::draw::Shape;
+        let module =
+            naga::front::wgsl::parse_str(super::WGSL_SRC).expect("the shader must parse");
+        let mut alpha = crate::shape_field::Field::new(&module, "shape_alpha");
+
+        let glow = Shape::GAUSS | Shape::OUTSIDE_ONLY;
+        // The fourth entry carries bits the function does not read —
+        // FILL, STROKE and a kind — so that "the rest are ignored" is
+        // asserted and not assumed.
+        let cases: [(&str, u32); 4] = [
+            ("crisp", 0),
+            ("shadow", Shape::GAUSS),
+            ("glow", glow),
+            ("glow beside bits it must ignore", glow | Shape::FILL | Shape::STROKE | (3 << Shape::KIND_SHIFT)),
+        ];
+        const TOL: f32 = 1e-6;
+        let mut compared = 0usize;
+        let mut lit = 0usize;
+        let mut worst = 0.0f32;
+        for (name, flags) in cases {
+            // Zero is in the sweep because it is the case NOTHING can
+            // reach through the toolkit — `shape_verts` drops a
+            // softness whose reach is not positive — and therefore the
+            // case where the two files could drift apart with no
+            // picture to show for it. They must still answer alike.
+            for &feather in &[0.0f32, 8.0, 24.0] {
+                for &w in &[0.5f32, 1.0, 3.0] {
+                    for i in -80..=160 {
+                        let d = i as f32 * 0.25;
+                        let want = nacelle::sdf::shape_alpha(d, w, feather, flags);
+                        let got = alpha.alpha(d, w, feather, flags);
+                        assert!(
+                            (got - want).abs() <= TOL,
+                            "{name}: at d={d}, w={w}, feather={feather} the \
+                             reference says {want} and the shader says {got}"
+                        );
+                        worst = worst.max((got - want).abs());
+                        compared += 1;
+                        lit += usize::from(want > 0.0);
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 4 * 3 * 3 * 241);
+        // Fail closed twice over: a sweep that lit nothing would have
+        // compared 5784 zeroes and passed.
+        assert!(lit > compared / 4, "only {lit} of {compared} samples carried any light");
+        assert!(worst.is_finite());
     }
 
     /// **Why f3 K4 cost this crate nothing.** The diagonal lane — every
