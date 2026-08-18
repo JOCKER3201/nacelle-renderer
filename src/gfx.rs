@@ -755,9 +755,16 @@ impl Gfx {
     /// the render pass were built from. Valid from the first frame — the
     /// constructor builds a swapchain before it hands the `Gfx` back —
     /// and it moves at the rebuild, not at the request, so a caller that
-    /// asks in the same breath as it sets still gets the OLD answer. The
-    /// settings window asks a frame later, which is when the wish has
-    /// become a fact.
+    /// asks in the same breath as it sets still gets the OLD answer.
+    ///
+    /// THE REBUILD IS INSIDE [`Gfx::render`], which is the whole of what
+    /// a caller has to know: ask AFTER a frame has been drawn, never
+    /// between setting the depth and drawing. The desktop's settings
+    /// window reads it on the line following its `draw_screen`, and
+    /// treats the gap between the request and that read as "not
+    /// measured" rather than as an answer — a wish paired with the
+    /// depth of the format being replaced reads as a shortfall the
+    /// surface was never asked about.
     pub fn color_depth(&self) -> u32 {
         format_bits(self.format.format)
     }
