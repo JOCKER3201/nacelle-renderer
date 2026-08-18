@@ -429,6 +429,12 @@ impl Gfx {
     /// refuses the device or the memory. A caller that gets an
     /// [`GfxError`] can print one sentence and exit; a caller that got
     /// the old `expect` could only watch a stack trace go by.
+    ///
+    /// A caller may also NOT exit — a desktop that cannot build one of
+    /// its screens goes on drawing the others — and that is why every
+    /// failing path here gives back what it had already taken. See
+    /// [`Gfx::furnish`] for the half of the construction that fails
+    /// into a `Drop` instead of by name.
     pub fn new(
         handle: &(impl HasDisplayHandle + HasWindowHandle),
         width: u32,
@@ -460,26 +466,37 @@ impl Gfx {
             let surface_loader = vk.surface_loader.clone();
 
             // GPU + queue family selection (graphics + present).
-            let pdevices = vk
-                .instance
-                .enumerate_physical_devices()
-                .map_err(|_| GfxError::NoDevice)?;
-            let (pdevice, queue_family) = pdevices
-                .iter()
-                .find_map(|&pd| {
-                    vk.instance
-                        .get_physical_device_queue_family_properties(pd)
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, props)| {
-                            let ok = props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                                && surface_loader
-                                    .get_physical_device_surface_support(pd, i as u32, surface)
-                                    .unwrap_or(false);
-                            if ok { Some((pd, i as u32)) } else { None }
-                        })
-                })
-                .ok_or(GfxError::NoDevice)?;
+            //
+            // The three exits in this stretch destroy the surface BY
+            // NAME, and they are the only ones that have to: until the
+            // logical device exists there is no `Gfx` to hang the
+            // handle on, so there is no `Drop` to run. Everything from
+            // the device onwards belongs to [`Gfx::furnish`], which
+            // fails into that `Drop` instead.
+            let pdevices = match vk.instance.enumerate_physical_devices() {
+                Ok(p) => p,
+                Err(_) => {
+                    surface_loader.destroy_surface(surface, None);
+                    return Err(GfxError::NoDevice);
+                }
+            };
+            let picked = pdevices.iter().find_map(|&pd| {
+                vk.instance
+                    .get_physical_device_queue_family_properties(pd)
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, props)| {
+                        let ok = props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                            && surface_loader
+                                .get_physical_device_surface_support(pd, i as u32, surface)
+                                .unwrap_or(false);
+                        if ok { Some((pd, i as u32)) } else { None }
+                    })
+            });
+            let Some((pdevice, queue_family)) = picked else {
+                surface_loader.destroy_surface(surface, None);
+                return Err(GfxError::NoDevice);
+            };
 
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default()
@@ -489,342 +506,26 @@ impl Gfx {
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&dev_exts);
-            let device = vk
-                .instance
-                .create_device(pdevice, &device_info, None)
-                .map_err(GfxError::NoLogicalDevice)?;
+            let device = match vk.instance.create_device(pdevice, &device_info, None) {
+                Ok(d) => d,
+                Err(e) => {
+                    surface_loader.destroy_surface(surface, None);
+                    return Err(GfxError::NoLogicalDevice(e));
+                }
+            };
             let queue = device.get_device_queue(queue_family, 0);
             // Unlike the surface loader, this one stays per `Gfx`: its
             // pointers come from `get_device_proc_addr`, so they belong
             // to this screen's device and to no other.
             let swapchain_loader = ash::khr::swapchain::Device::new(&vk.instance, &device);
-
-            // Surface format: the depth preference decides later, at
-            // recreate; the start is the plain eight-bit UNORM path.
-            let formats = surface_loader
-                .get_physical_device_surface_formats(pdevice, surface)
-                .map_err(GfxError::NoFormat)?;
-            let format = pick_format(&formats, 8);
-
-            let render_pass = create_render_pass(&device, format.format);
-            let blur_pass = create_blur_pass(&device, format.format);
-
-            // Descriptors: atlas texture (binding 0) + sampler (binding 1),
-            // because WGSL has no combined image sampler.
-            let bindings = [
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            ];
-            let desc_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                    None,
-                )
-                .unwrap();
-            let pool_sizes = [
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1),
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1),
-            ];
-            let desc_pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&pool_sizes),
-                    None,
-                )
-                .unwrap();
-            let layouts = [desc_layout];
-            let desc_set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(desc_pool)
-                        .set_layouts(&layouts),
-                )
-                .unwrap()[0];
-
-            // The grading LUT lives in its own set (group 1): the
-            // atlas set and every image set share group 0's layout,
-            // and the LUT must not have to be written into each.
-            let lut_bindings = [
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            ];
-            let lut_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&lut_bindings),
-                    None,
-                )
-                .unwrap();
-
-            // Set 2: the shape records (f3 D4). Set 0 is repinned per
-            // run — a texture and a pyramid target each own a set — so
-            // the one frame-wide storage buffer gets its own group, its
-            // own layout and its own one-set pool; the existing pools
-            // hold only SAMPLED_IMAGE and SAMPLER counts (R5).
-            let shapes_bindings = [vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-            let shapes_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&shapes_bindings),
-                    None,
-                )
-                .unwrap();
-            let shapes_pool_sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)];
-            let shapes_pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&shapes_pool_sizes),
-                    None,
-                )
-                .unwrap();
-            let shapes_layouts = [shapes_layout];
-            let shapes_set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(shapes_pool)
-                        .set_layouts(&shapes_layouts),
-                )
-                .unwrap()[0];
-
-            let pipes =
-                create_pipeline(&device, render_pass, desc_layout, lut_layout, shapes_layout);
-
-            // Room for the application's images: browser frames,
-            // previews, a wallpaper. Freed individually as images go.
-            let tex_pool_sizes = [
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(96),
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(96),
-            ];
-            let tex_pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                        .max_sets(96)
-                        .pool_sizes(&tex_pool_sizes),
-                    None,
-                )
-                .unwrap();
-
             let mem_props = vk.instance.get_physical_device_memory_properties(pdevice);
 
-            // The identity LUT: two voxels an edge, each the colour of
-            // its own corner. Present from the first frame so the
-            // pipeline layout never has an unbound set; replaced in
-            // place when a .cube is chosen.
-            let (lut_image, lut_mem, lut_view) = create_lut_image(&device, &mem_props, 2)
-                .ok_or(GfxError::NoMemory("grading LUT"))?;
-            let lut_set_layouts = [lut_layout];
-            let lut_set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(tex_pool)
-                        .set_layouts(&lut_set_layouts),
-                )
-                .unwrap()[0];
-
-            // Glyph atlas: R8, device-local.
-            let atlas_info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::R8_UNORM)
-                .extent(vk::Extent3D {
-                    width: ATLAS_W as u32,
-                    height: ATLAS_H as u32,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                .initial_layout(vk::ImageLayout::UNDEFINED);
-            let atlas_image = device.create_image(&atlas_info, None).unwrap();
-            let req = device.get_image_memory_requirements(atlas_image);
-            let atlas_mem = alloc_memory(
-                &device,
-                &mem_props,
-                req,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-            .ok_or(GfxError::NoMemory("glyph atlas"))?;
-            device.bind_image_memory(atlas_image, atlas_mem, 0).unwrap();
-            let atlas_view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(atlas_image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8_UNORM)
-                        .subresource_range(color_range()),
-                    None,
-                )
-                .unwrap();
-
-            let sampler = device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::LINEAR)
-                        .min_filter(vk::Filter::LINEAR)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .unwrap();
-
-            let tex_info = [vk::DescriptorImageInfo::default()
-                .image_view(atlas_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let samp_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(desc_set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&tex_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(desc_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&samp_info),
-            ];
-            device.update_descriptor_sets(&writes, &[]);
-            let lut_tex_info = [vk::DescriptorImageInfo::default()
-                .image_view(lut_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let lut_writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(lut_set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&lut_tex_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(lut_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&samp_info),
-            ];
-            device.update_descriptor_sets(&lut_writes, &[]);
-
-            // Staging buffer for atlas uploads.
-            let (staging_buf, staging_mem, staging_ptr) = create_host_buffer(
-                &device,
-                &mem_props,
-                (ATLAS_W * ATLAS_H) as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-            )
-            .ok_or(GfxError::NoMemory("atlas staging buffer"))?;
-
-            // Vertex buffer (host-visible, persistently mapped).
-            let (vertex_buf, vertex_mem, vertex_ptr) = create_host_buffer(
-                &device,
-                &mem_props,
-                (MAX_VERTS * std::mem::size_of::<Vertex>()) as u64,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-            )
-            .ok_or(GfxError::NoMemory("vertex buffer"))?;
-
-            // Shape records: the same persistent mapping, written each
-            // frame beside the vertices, read by fs_shape through set 2.
-            let (shapes_buf, shapes_mem, shapes_ptr) = create_host_buffer(
-                &device,
-                &mem_props,
-                (MAX_SHAPES * std::mem::size_of::<Shape>()) as u64,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-            )
-            .ok_or(GfxError::NoMemory("shape record buffer"))?;
-            let shapes_buf_info = [vk::DescriptorBufferInfo::default()
-                .buffer(shapes_buf)
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
-            let shapes_write = [vk::WriteDescriptorSet::default()
-                .dst_set(shapes_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&shapes_buf_info)];
-            device.update_descriptor_sets(&shapes_write, &[]);
-
-            let cmd_pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(queue_family)
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                    None,
-                )
-                .unwrap();
-            let cmd_buf = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .unwrap()[0];
-
-            let sem_image = device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .unwrap();
-            let sem_render = device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .unwrap();
-            let fence = device
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-                .unwrap();
-
-            // GPU timing, only if asked for. Two device facts decide
-            // whether it can work at all: the length of a tick
-            // (`timestampPeriod`, nanoseconds) and how many bits of a
-            // timestamp this queue family actually fills
-            // (`timestampValidBits`). The family is asked rather than
-            // the device-wide `timestampComputeAndGraphics`, because
-            // the family's answer is the exact one for the queue the
-            // frames go to; the device-wide promise is only reported.
-            let limits = vk.instance.get_physical_device_properties(pdevice).limits;
-            let valid_bits = vk
-                .instance
-                .get_physical_device_queue_family_properties(pdevice)
-                .get(queue_family as usize)
-                .map(|q| q.timestamp_valid_bits)
-                .unwrap_or(0);
-            let timing = GpuTiming::from_env(
-                &device,
-                limits.timestamp_period,
-                valid_bits,
-                limits.timestamp_compute_and_graphics == vk::TRUE,
-                FRAMES_IN_FLIGHT,
-            );
-
+            // The renderer exists from this line on, and it is EMPTY:
+            // every handle null, every list empty, no format chosen.
+            // Null is what makes that safe to drop — `vkDestroy*` and
+            // `vkFree*` take a null handle and do nothing — and being
+            // droppable is the whole point, because it is what the rest
+            // of the construction fails INTO.
             let mut gfx = Gfx {
                 surface_loader,
                 surface,
@@ -835,65 +536,466 @@ impl Gfx {
                 queue,
                 swapchain_loader,
                 swapchain: vk::SwapchainKHR::null(),
-                format,
+                format: vk::SurfaceFormatKHR::default(),
                 extent: vk::Extent2D { width: 0, height: 0 },
                 images: vec![],
                 views: vec![],
-                render_pass,
+                render_pass: vk::RenderPass::null(),
                 framebuffers: vec![],
-                pipeline_layout: pipes.layout,
-                pipes: pipes.by_pipe,
-                blur_pass,
+                pipeline_layout: vk::PipelineLayout::null(),
+                pipes: [vk::Pipeline::null(); Pipe::N],
+                blur_pass: vk::RenderPass::null(),
                 blur_targets: Vec::new(),
                 blur_depth: 3,
                 text_gamma: 1.0,
-                desc_layout,
-                desc_pool,
-                desc_set,
-                tex_pool,
+                desc_layout: vk::DescriptorSetLayout::null(),
+                desc_pool: vk::DescriptorPool::null(),
+                desc_set: vk::DescriptorSet::null(),
+                tex_pool: vk::DescriptorPool::null(),
                 textures: HashMap::new(),
                 next_tex: 1,
                 retired: Vec::new(),
                 mem_props,
                 depth_pref: 8,
-                lut_layout,
-                lut_set,
-                lut_image,
-                lut_mem,
-                lut_view,
+                lut_layout: vk::DescriptorSetLayout::null(),
+                lut_set: vk::DescriptorSet::null(),
+                lut_image: vk::Image::null(),
+                lut_mem: vk::DeviceMemory::null(),
+                lut_view: vk::ImageView::null(),
                 lut_size: 0,
                 lut_pending: Some((2, identity_lut(2))),
                 lut_initialized: false,
-                sampler,
-                atlas_image,
-                atlas_mem,
-                atlas_view,
+                sampler: vk::Sampler::null(),
+                atlas_image: vk::Image::null(),
+                atlas_mem: vk::DeviceMemory::null(),
+                atlas_view: vk::ImageView::null(),
                 atlas_initialized: false,
                 pending_atlas_rows: None,
-                staging_buf,
-                staging_mem,
-                staging_ptr,
-                vertex_buf,
-                vertex_mem,
-                vertex_ptr,
-                shapes_layout,
-                shapes_pool,
-                shapes_set,
-                shapes_buf,
-                shapes_mem,
-                shapes_ptr,
-                cmd_pool,
-                cmd_buf,
-                sem_image,
-                sem_render,
-                fence,
+                staging_buf: vk::Buffer::null(),
+                staging_mem: vk::DeviceMemory::null(),
+                staging_ptr: std::ptr::null_mut(),
+                vertex_buf: vk::Buffer::null(),
+                vertex_mem: vk::DeviceMemory::null(),
+                vertex_ptr: std::ptr::null_mut(),
+                shapes_layout: vk::DescriptorSetLayout::null(),
+                shapes_pool: vk::DescriptorPool::null(),
+                shapes_set: vk::DescriptorSet::null(),
+                shapes_buf: vk::Buffer::null(),
+                shapes_mem: vk::DeviceMemory::null(),
+                shapes_ptr: std::ptr::null_mut(),
+                cmd_pool: vk::CommandPool::null(),
+                cmd_buf: vk::CommandBuffer::null(),
+                sem_image: vk::Semaphore::null(),
+                sem_render: vk::Semaphore::null(),
+                fence: vk::Fence::null(),
                 needs_recreate: false,
                 needs_surface: false,
-                timing,
+                timing: None,
             };
+
+            // This `?` is the whole reason the construction is in two
+            // halves: it drops `gfx`, and that drop destroys the device
+            // and the surface together with whatever `furnish` had
+            // already managed to build.
+            gfx.furnish(vk, queue_family)?;
             gfx.recreate_swapchain(width, height);
             Ok(gfx)
         }
+    }
+
+    /// Fills the empty renderer in: the format, the render passes, the
+    /// descriptor plumbing, the pipelines, the glyph atlas, the mapped
+    /// buffers, the command pool and the sync objects.
+    ///
+    /// WHY THIS IS A SECOND STEP and not simply the rest of
+    /// [`Gfx::new`]: six of the steps below can fail on a machine that
+    /// has no memory for what they ask, and turning those panics into
+    /// errors would have MOVED the fault rather than repaired it. A
+    /// `?` out of the middle of a constructor drops nothing — the
+    /// struct whose `Drop` destroys the device does not exist yet — so
+    /// each of those exits would have leaked a `VkDevice` and a
+    /// `VkSurfaceKHR`, and with them the render passes, pipelines,
+    /// pools, sampler and atlas image made before the failing line.
+    /// Under the panics that came before, that cost nothing: the
+    /// process ended and the kernel swept up. It costs everything for a
+    /// caller that goes ON — a desktop skipping the one screen it
+    /// cannot draw on is exactly the caller this branch exists for,
+    /// and it would have leaked a device per unusable monitor.
+    ///
+    /// Filling an already-built `Gfx` gives every one of those failures
+    /// the same exit and the same cleanup: the caller's `?` drops the
+    /// half-built renderer, and [`Gfx`]'s `Drop` destroys precisely the
+    /// handles that got made. The rest are still null, which every
+    /// `vkDestroy*` and `vkFree*` accepts and ignores.
+    ///
+    /// # Safety
+    /// Vulkan calls throughout. `vk` must be the instance this `Gfx`'s
+    /// device was created from, and `queue_family` the family its queue
+    /// was taken from.
+    unsafe fn furnish(&mut self, vk: &Vk, queue_family: u32) -> Result<(), GfxError> {
+        // Surface format: the depth preference decides later, at
+        // recreate; the start is the plain eight-bit UNORM path.
+        let formats = self
+            .surface_loader
+            .get_physical_device_surface_formats(self.pdevice, self.surface)
+            .map_err(GfxError::NoFormat)?;
+        self.format = pick_format(&formats, 8);
+
+        self.render_pass = create_render_pass(&self.device, self.format.format);
+        self.blur_pass = create_blur_pass(&self.device, self.format.format);
+
+        // Descriptors: atlas texture (binding 0) + sampler (binding 1),
+        // because WGSL has no combined image sampler.
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        self.desc_layout = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+            .unwrap();
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1),
+        ];
+        self.desc_pool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+            .unwrap();
+        let layouts = [self.desc_layout];
+        self.desc_set = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.desc_pool)
+                    .set_layouts(&layouts),
+            )
+            .unwrap()[0];
+
+        // The grading LUT lives in its own set (group 1): the
+        // atlas set and every image set share group 0's layout,
+        // and the LUT must not have to be written into each.
+        let lut_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        self.lut_layout = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&lut_bindings),
+                None,
+            )
+            .unwrap();
+
+        // Set 2: the shape records (f3 D4). Set 0 is repinned per
+        // run — a texture and a pyramid target each own a set — so
+        // the one frame-wide storage buffer gets its own group, its
+        // own layout and its own one-set pool; the existing pools
+        // hold only SAMPLED_IMAGE and SAMPLER counts (R5).
+        let shapes_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        self.shapes_layout = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&shapes_bindings),
+                None,
+            )
+            .unwrap();
+        let shapes_pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)];
+        self.shapes_pool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&shapes_pool_sizes),
+                None,
+            )
+            .unwrap();
+        let shapes_layouts = [self.shapes_layout];
+        self.shapes_set = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.shapes_pool)
+                    .set_layouts(&shapes_layouts),
+            )
+            .unwrap()[0];
+
+        let pipes = create_pipeline(
+            &self.device,
+            self.render_pass,
+            self.desc_layout,
+            self.lut_layout,
+            self.shapes_layout,
+        );
+        self.pipeline_layout = pipes.layout;
+        self.pipes = pipes.by_pipe;
+
+        // Room for the application's images: browser frames,
+        // previews, a wallpaper. Freed individually as images go.
+        let tex_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(96),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(96),
+        ];
+        self.tex_pool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+                    .max_sets(96)
+                    .pool_sizes(&tex_pool_sizes),
+                None,
+            )
+            .unwrap();
+
+        // The identity LUT: two voxels an edge, each the colour of
+        // its own corner. Present from the first frame so the
+        // pipeline layout never has an unbound set; replaced in
+        // place when a .cube is chosen.
+        let (lut_image, lut_mem, lut_view) = create_lut_image(&self.device, &self.mem_props, 2)
+            .ok_or(GfxError::NoMemory("grading LUT"))?;
+        self.lut_image = lut_image;
+        self.lut_mem = lut_mem;
+        self.lut_view = lut_view;
+        let lut_set_layouts = [self.lut_layout];
+        self.lut_set = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.tex_pool)
+                    .set_layouts(&lut_set_layouts),
+            )
+            .unwrap()[0];
+
+        // Glyph atlas: R8, device-local.
+        let atlas_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8_UNORM)
+            .extent(vk::Extent3D {
+                width: ATLAS_W as u32,
+                height: ATLAS_H as u32,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        self.atlas_image = self.device.create_image(&atlas_info, None).unwrap();
+        let req = self.device.get_image_memory_requirements(self.atlas_image);
+        self.atlas_mem = alloc_memory(
+            &self.device,
+            &self.mem_props,
+            req,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or(GfxError::NoMemory("glyph atlas"))?;
+        self.device
+            .bind_image_memory(self.atlas_image, self.atlas_mem, 0)
+            .unwrap();
+        self.atlas_view = self
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(self.atlas_image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8_UNORM)
+                    .subresource_range(color_range()),
+                None,
+            )
+            .unwrap();
+
+        self.sampler = self
+            .device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+            .unwrap();
+
+        let tex_info = [vk::DescriptorImageInfo::default()
+            .image_view(self.atlas_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let samp_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&tex_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&samp_info),
+        ];
+        self.device.update_descriptor_sets(&writes, &[]);
+        let lut_tex_info = [vk::DescriptorImageInfo::default()
+            .image_view(self.lut_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let lut_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.lut_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&lut_tex_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.lut_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&samp_info),
+        ];
+        self.device.update_descriptor_sets(&lut_writes, &[]);
+
+        // Staging buffer for atlas uploads.
+        let (staging_buf, staging_mem, staging_ptr) = create_host_buffer(
+            &self.device,
+            &self.mem_props,
+            (ATLAS_W * ATLAS_H) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )
+        .ok_or(GfxError::NoMemory("atlas staging buffer"))?;
+        self.staging_buf = staging_buf;
+        self.staging_mem = staging_mem;
+        self.staging_ptr = staging_ptr;
+
+        // Vertex buffer (host-visible, persistently mapped).
+        let (vertex_buf, vertex_mem, vertex_ptr) = create_host_buffer(
+            &self.device,
+            &self.mem_props,
+            (MAX_VERTS * std::mem::size_of::<Vertex>()) as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )
+        .ok_or(GfxError::NoMemory("vertex buffer"))?;
+        self.vertex_buf = vertex_buf;
+        self.vertex_mem = vertex_mem;
+        self.vertex_ptr = vertex_ptr;
+
+        // Shape records: the same persistent mapping, written each
+        // frame beside the vertices, read by fs_shape through set 2.
+        let (shapes_buf, shapes_mem, shapes_ptr) = create_host_buffer(
+            &self.device,
+            &self.mem_props,
+            (MAX_SHAPES * std::mem::size_of::<Shape>()) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )
+        .ok_or(GfxError::NoMemory("shape record buffer"))?;
+        self.shapes_buf = shapes_buf;
+        self.shapes_mem = shapes_mem;
+        self.shapes_ptr = shapes_ptr;
+        let shapes_buf_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.shapes_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let shapes_write = [vk::WriteDescriptorSet::default()
+            .dst_set(self.shapes_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&shapes_buf_info)];
+        self.device.update_descriptor_sets(&shapes_write, &[]);
+
+        self.cmd_pool = self
+            .device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .unwrap();
+        self.cmd_buf = self
+            .device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .unwrap()[0];
+
+        self.sem_image = self
+            .device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            .unwrap();
+        self.sem_render = self
+            .device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            .unwrap();
+        self.fence = self
+            .device
+            .create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+            .unwrap();
+
+        // GPU timing, only if asked for. Two device facts decide
+        // whether it can work at all: the length of a tick
+        // (`timestampPeriod`, nanoseconds) and how many bits of a
+        // timestamp this queue family actually fills
+        // (`timestampValidBits`). The family is asked rather than
+        // the device-wide `timestampComputeAndGraphics`, because
+        // the family's answer is the exact one for the queue the
+        // frames go to; the device-wide promise is only reported.
+        let limits = vk.instance.get_physical_device_properties(self.pdevice).limits;
+        let valid_bits = vk
+            .instance
+            .get_physical_device_queue_family_properties(self.pdevice)
+            .get(queue_family as usize)
+            .map(|q| q.timestamp_valid_bits)
+            .unwrap_or(0);
+        self.timing = GpuTiming::from_env(
+            &self.device,
+            limits.timestamp_period,
+            valid_bits,
+            limits.timestamp_compute_and_graphics == vk::TRUE,
+            FRAMES_IN_FLIGHT,
+        );
+
+        Ok(())
     }
 
     pub fn resize(&mut self) {
@@ -991,10 +1093,27 @@ impl Gfx {
     /// is what makes `render` skip the frame rather than draw into
     /// nothing, and what brings the next frame back here to try again.
     ///
-    /// The teardown runs ONCE per loss, not once per retry: a window
-    /// that is gone for good would otherwise stall the device and churn
-    /// two semaphores sixty times a second, and say so sixty times a
-    /// second, for as long as the process lived.
+    /// The teardown runs once per loss, not once per retry — AS FAR AS
+    /// `first_try` reaches, and that is not as far as it sounds. The
+    /// flag is `surface != null`, and the surface is only left null
+    /// when `create_surface` itself FAILED. Under Wayland and X11 that
+    /// call mostly just wraps the handles it is given
+    /// (`wl_display` + `wl_surface`, or an xcb connection and window)
+    /// and SUCCEEDS even for a window that is gone; the loss is then
+    /// reported by the next call that touches the surface for real.
+    /// So a window closed for good takes the other road: a surface is
+    /// made, `recreate_swapchain` meets `SURFACE_LOST` again, sets
+    /// `needs_surface` again, and the next frame tears the whole thing
+    /// down once more — device wait, blur targets, framebuffers,
+    /// views, swapchain, surface and both semaphores — sixty times a
+    /// second, and silently, because the message above sits only in
+    /// the branch where `create_surface` failed.
+    ///
+    /// NOT REPAIRED HERE, and named rather than left to be rediscovered:
+    /// the honest fix is a backoff on the repair itself — a surface
+    /// counts as proven only once a swapchain has been built on it, and
+    /// an unproven one is not retried on every frame. That is a state
+    /// machine, not a line, and this branch is a bugfix branch.
     unsafe fn rebuild_surface(&mut self) {
         let first_try = self.surface != vk::SurfaceKHR::null();
         if first_try {
@@ -1072,9 +1191,32 @@ impl Gfx {
             // The depth preference may have moved since the last
             // build. A new format means a new render pass and new
             // pipelines — they are compiled against it.
-            if let Ok(formats) = self
+            //
+            // This is the FIRST of the three questions this function
+            // puts to the surface, and it is read like the other two.
+            // It used to be the exception — `if let Ok(..)`, no else —
+            // and a `SURFACE_LOST` from here was recorded nowhere: the
+            // old format was kept and the function walked on to ask a
+            // dead surface for its size. The loss was caught twenty
+            // lines down, so nothing broke; but a rule that holds for
+            // two of three neighbouring calls is a rule nobody will
+            // read as a rule.
+            let formats = match self
                 .surface_loader
                 .get_physical_device_surface_formats(self.pdevice, self.surface)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    let f = fault_of(e);
+                    if f.is_fatal() {
+                        eprintln!("nacelle-renderer: the surface will not say its formats: {e:?}");
+                    }
+                    self.extent = vk::Extent2D { width: 0, height: 0 };
+                    self.needs_recreate = true;
+                    self.needs_surface |= f.rebuilds_surface();
+                    return;
+                }
+            };
             {
                 let want = pick_format(&formats, self.depth_pref);
                 if want.format != self.format.format
@@ -2054,9 +2196,16 @@ impl Gfx {
 
     /// Registers an RGBA image of the given size. The handle is what
     /// [`nacelle::draw::DrawList::image`] takes; pixels arrive through
-    /// [`Gfx::update_texture`]. No widget consumes these yet — they are
-    /// the renderer's half of the image contract, waiting for the
-    /// first image-drawing widget (the browser is the planned one).
+    /// [`Gfx::update_texture`].
+    ///
+    /// IT HAS CALLERS, and the `allow` below says nothing to the
+    /// contrary — `dead_code` only ever looked inside this crate. The
+    /// live one is `nacelle-desktop`'s `install_plate` (screen.rs),
+    /// which registers the two theme plates, "backdrop" and "overlay",
+    /// and re-registers them whenever a theme swap or a resize changes
+    /// their size. A branch that reads the `allow` as "no callers" and
+    /// changes the signature breaks that file; this note is here
+    /// because one already did.
     ///
     /// `None` when the device has no memory for the image. A caller
     /// that asked for a wallpaper and did not get one has a picture to
@@ -3717,6 +3866,87 @@ mod tests {
         assert_eq!(find_memory_type(&short, 0b111, F::HOST_VISIBLE), None);
     }
 
+    /// **A construction that fails after the device exists must have
+    /// something to give the device back to.**
+    ///
+    /// Turning the constructor's panics into errors moved the fault
+    /// instead of repairing it. A `?` out of the middle of a
+    /// constructor drops NOTHING — the struct whose `Drop` destroys
+    /// the device has not been built yet — so every one of those exits
+    /// walked out on a `VkDevice`, a `VkSurfaceKHR` and everything
+    /// made in between, for the life of the process. Panics had hidden
+    /// that: the process ended and the kernel swept up. The whole
+    /// point of the change is a caller that goes ON, and a desktop that
+    /// skips one unusable monitor per plug event would have leaked a
+    /// device per event.
+    ///
+    /// The repair is structural, so the guard is too: the fallible
+    /// steps live in `furnish`, which fills an ALREADY-BUILT `Gfx`, and
+    /// the only exits left in `new` itself are the three before the
+    /// device exists — each handing the surface back by name, because
+    /// at that moment nothing else can.
+    ///
+    /// This reads the source rather than running the constructor
+    /// because running it needs a GPU, and the property is about which
+    /// LINE a failure leaves from. Checked red against the code it
+    /// replaces: on the old `new`, the seven `?` exits between the
+    /// device and the struct trip the first assertion and the absent
+    /// named exits trip the second.
+    #[test]
+    fn no_construction_step_can_fail_before_there_is_a_drop_to_catch_it() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gfx.rs"))
+            .expect("this file");
+        let start = src.find("    pub fn new(").expect("Gfx::new");
+        let struct_at = src[start..]
+            .find("let mut gfx = Gfx {")
+            .expect("Gfx::new builds a Gfx")
+            + start;
+        let device_at = src[start..]
+            .find("let queue = device.get_device_queue")
+            .expect("Gfx::new creates a logical device")
+            + start;
+        assert!(
+            device_at < struct_at,
+            "the device is made after the struct, and this test no longer knows what it is reading"
+        );
+
+        // Nothing between the device and the struct may fail by `?`:
+        // there is no `Drop` yet, so such an exit is a leak by
+        // construction.
+        let between = &src[device_at..struct_at];
+        for leaky in [".map_err(GfxError::", ".ok_or(GfxError::", "?;"] {
+            assert!(
+                !between.contains(leaky),
+                "`{leaky}` sits between the logical device and the struct whose Drop frees it; \
+                 that exit leaks a VkDevice and a VkSurfaceKHR. Move the step into `furnish`."
+            );
+        }
+
+        // And the exits that come BEFORE the struct hand the surface
+        // back themselves, because at that point nothing else will.
+        let head: Vec<&str> = src[start..struct_at].lines().collect();
+        let mut named = 0;
+        for (i, line) in head.iter().enumerate() {
+            if line.contains("return Err(GfxError::") {
+                named += 1;
+                assert!(
+                    head[..i]
+                        .iter()
+                        .rev()
+                        .take(3)
+                        .any(|l| l.contains("destroy_surface")),
+                    "an exit from Gfx::new walks out on the surface: {}",
+                    line.trim()
+                );
+            }
+        }
+        assert!(
+            named > 0,
+            "Gfx::new has no named exit at all — either the surface is created later than this \
+             test believes, or the guard is reading nothing and passing"
+        );
+    }
+
     /// **The number in the package description is the number of
     /// pipelines the device is actually asked for.**
     ///
@@ -3749,6 +3979,28 @@ mod tests {
         assert!(
             readme.contains(&format!("{word} pipelines")),
             "the README advertises a pipeline count that is not {word}"
+        );
+
+        // The THIRD sentence about the same number, and the one that
+        // had actually drifted: this file's own header. Leaving it out
+        // of the guard was the flaw in the first version of this test —
+        // it tied down the two sentences that were wrong and left free
+        // the one that had already gone wrong once. Case-folded because
+        // the header shouts the number.
+        let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gfx.rs"))
+            .expect("this file")
+            .lines()
+            .take_while(|l| l.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+        assert!(
+            !header.is_empty(),
+            "the module header is gone, and with it the sentence this guards"
+        );
+        assert!(
+            header.contains(&format!("{word} pipelines")),
+            "the header of gfx.rs advertises a pipeline count that is not {word}"
         );
 
         // The sibling list is part of the same drift. `nacelle-widgets`
