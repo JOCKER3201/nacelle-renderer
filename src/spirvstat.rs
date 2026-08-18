@@ -901,18 +901,19 @@ mod tests {
     }
 
     /// The real thing: the module this renderer uploads, read back.
-    /// Five entry points, each reachable, each with a body — a report
+    /// Six entry points, each reachable, each with a body — a report
     /// of zero would mean the walker missed the function section. The
-    /// fifth is `fs_shape`: the vector lane is dark in the picture
-    /// (`render.vector = false`) but its code ships in the module, and
-    /// the measurement is of what ships.
+    /// last two are the vector lane's: `fs_shape` and, since K3b, the
+    /// frosted `fs_shape_glass`. Both are dark in the picture
+    /// (`render.vector = false`) but their code ships in the module,
+    /// and the measurement is of what ships.
     #[test]
     fn the_shipping_module_reads_back_with_all_of_its_entry_points() {
         let m = builtin().expect("the renderer's own SPIR-V parses");
         let names: Vec<&str> = m.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["vs_main", "fs_main", "fs_blur", "fs_image", "fs_shape"]
+            vec!["vs_main", "fs_main", "fs_blur", "fs_image", "fs_shape", "fs_shape_glass"]
         );
         for cost in m.costs() {
             assert!(cost.total.total() > 0, "{} has an empty body", cost.name);
@@ -969,14 +970,21 @@ mod tests {
         // axes. `fwidth` would be ONE instruction of this chapter and
         // the wrong number on a rotated frame, so the count is what
         // tells the two apart from here, without reading the WGSL.
-        let fs_shape = cost("fs_shape");
-        assert_eq!(
-            fs_shape.total.class(Class::Deriv),
-            2,
-            "the shape fragment stopped reading the gradient on both axes"
-        );
+        //
+        // The lane has TWO entry points since K3b and one `shape_cover`
+        // between them, so both report the pair and neither reports
+        // four: the count is per entry point INCLUDING what it calls,
+        // which is exactly how a second copy of the field would show up
+        // here — as a third pair, in a third fragment.
+        for name in ["fs_shape", "fs_shape_glass"] {
+            assert_eq!(
+                cost(name).total.class(Class::Deriv),
+                2,
+                "{name} stopped reading the gradient on both axes"
+            );
+        }
         for c in m.costs() {
-            if c.name == "fs_shape" {
+            if c.name.starts_with("fs_shape") {
                 continue;
             }
             assert_eq!(
@@ -986,6 +994,59 @@ mod tests {
                 c.name
             );
         }
+        // The frosted fragment samples: the pyramid, plus grade()'s
+        // LUT. Its own sample is the frost and there is exactly one —
+        // a second would mean a second target, which one run cannot
+        // bind (the reason the rank rides the handle).
+        let glass = cost("fs_shape_glass");
+        assert_eq!(glass.own.samples(), 1);
+        assert_eq!(glass.total.samples(), 2);
+        // …and the plain shape fragment still reads no image but the
+        // LUT: the record IS its picture.
+        assert_eq!(cost("fs_shape").own.samples(), 0);
+    }
+
+    /// **What K3b's split into functions cost the shape lane, and what
+    /// it did not.** The field's mathematics moved out of `fs_shape`'s
+    /// body into `shape_distance`/`shape_cover`/`over`/`shape_compose`
+    /// so that the frosted entry point could call the same forms
+    /// instead of carrying a second copy of them. That moved a number
+    /// every measurement of this lane is quoted from, and a moved
+    /// number with no note is a number somebody re-reads as a
+    /// regression.
+    ///
+    /// Measured on both sides of the split, with this file's own
+    /// walker: `fs_shape.own.compute()` 78 → 6 and `own.class(Alu)`
+    /// 57 → 5, because the body is now a call; `total.total()`
+    /// 174 → 199, the 25 being OpFunction / OpFunctionParameter /
+    /// OpLabel / OpReturnValue / OpFunctionCall and the locals they
+    /// need. THE WORK IS UNCHANGED TO THE INSTRUCTION, and that is
+    /// what the two assertions below pin: reachable compute and
+    /// reachable ALU are the same numbers as before K3b.
+    ///
+    /// Which is also the lesson for whoever pins the next one: on an
+    /// entry point that calls anything, `own` measures where the code
+    /// was WRITTEN and `total` measures what the fragment DOES. A
+    /// budget belongs on `total`.
+    #[test]
+    fn the_shape_lane_computes_what_it_computed_before_it_was_split_up() {
+        let m = builtin().expect("the renderer's own SPIR-V parses");
+        let shape = m
+            .costs()
+            .into_iter()
+            .find(|c| c.name == "fs_shape")
+            .expect("fs_shape is missing");
+        assert_eq!(shape.total.compute(), 87, "the field's work changed");
+        assert_eq!(shape.total.class(Class::Alu), 63, "the field's ALU changed");
+        // And the body itself is now scaffolding: a handful of loads
+        // and four calls. If this grows, the mathematics came back —
+        // which is the second copy K3b existed to prevent.
+        assert!(shape.own.compute() < 20, "the field moved back into the body");
+        assert_eq!(
+            shape.callees,
+            vec!["grade", "shape_compose", "shape_cover", "shape_distance"],
+            "the plain lane's callees are the shared forms and the grade"
+        );
     }
 
     /// The road for a foreign source must be the road for ours, or a
@@ -1023,7 +1084,7 @@ mod tests {
         // Our own file is the case that has to work.
         let lifted = wgsl_from_rust(include_str!("shaders.rs")).expect("shaders.rs carries WGSL");
         assert!(lifted.contains("fn fs_main("));
-        assert_eq!(from_wgsl(lifted).unwrap().entries.len(), 5);
+        assert_eq!(from_wgsl(lifted).unwrap().entries.len(), 6);
     }
 
     /// A refusal must arrive as a message, not as a panic in the middle

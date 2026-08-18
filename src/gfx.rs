@@ -21,10 +21,15 @@ use crate::timing::{
 };
 
 const MAX_VERTS: usize = 400_000;
-/// Shape records per frame: 16 384 × 64 B = 1 MB, host-visible and
+/// Shape records per frame: 16 384 × 80 B = 1.31 MB, host-visible and
 /// persistently mapped like the vertex buffer. Overflow degrades the
 /// MAX_VERTS way — records past the limit are clipped, the frame is
 /// never lost (f3 2.5, R5).
+///
+/// The record was 64 B when §2.5 sized it and grew a `tint` with K3b
+/// (§3.3). The allocation below has always read `size_of::<Shape>()`,
+/// so nothing moved but this sentence; it is written out because a
+/// budget nobody can check against the code is a budget that drifts.
 const MAX_SHAPES: usize = 16_384;
 
 /// How many frames the CPU may be ahead of the GPU: one command
@@ -179,17 +184,12 @@ pub struct Gfx {
     render_pass: vk::RenderPass,
     framebuffers: Vec<vk::Framebuffer>,
     pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
-    pipeline_image: vk::Pipeline,
-    pipeline_blur: vk::Pipeline,
-    /// fs_main under SRC_ALPHA/ONE colour, ZERO/ONE alpha: runs tagged
-    /// ADD_ATLAS compose with light. Destination alpha stays untouched,
-    /// which is what a passthrough swapchain will need (r1 R1/R8).
-    pipeline_add: vk::Pipeline,
-    /// fs_shape, normal blend: the vector core's lane. Dead code by
-    /// intent until libnacelle's `render.vector` arms the SHAPE runs —
-    /// nothing in the shipped picture emits them (f3 K1).
-    pipeline_shape: vk::Pipeline,
+    /// The graphics pipelines, indexed by [`Pipe`] — an ARRAY and not
+    /// six fields, so that choosing one is `pipes[pipe_of(kind)]` and
+    /// the choosing is a pure function a test can call. Nothing here
+    /// can be checked without a device; what can be checked is which
+    /// NAME a run asks for, and that is where the choice now lives.
+    pipes: [vk::Pipeline; Pipe::N],
     /// Offscreen pass for the frosted-glass chain: same format as the
     /// swapchain (which is what lets the ordinary pipelines draw into
     /// it), ending in a shader-readable layout.
@@ -676,11 +676,7 @@ impl Gfx {
                 render_pass,
                 framebuffers: vec![],
                 pipeline_layout: pipes.layout,
-                pipeline: pipes.atlas,
-                pipeline_image: pipes.image,
-                pipeline_blur: pipes.blur,
-                pipeline_add: pipes.add,
-                pipeline_shape: pipes.shape,
+                pipes: pipes.by_pipe,
                 blur_pass,
                 blur_targets: Vec::new(),
                 blur_depth: 3,
@@ -802,11 +798,9 @@ impl Gfx {
                         want.format, want.color_space
                     );
                     self.format = want;
-                    self.device.destroy_pipeline(self.pipeline, None);
-                    self.device.destroy_pipeline(self.pipeline_image, None);
-                    self.device.destroy_pipeline(self.pipeline_blur, None);
-                    self.device.destroy_pipeline(self.pipeline_add, None);
-                    self.device.destroy_pipeline(self.pipeline_shape, None);
+                    for p in self.pipes {
+                        self.device.destroy_pipeline(p, None);
+                    }
                     self.device
                         .destroy_pipeline_layout(self.pipeline_layout, None);
                     self.device.destroy_render_pass(self.render_pass, None);
@@ -823,11 +817,7 @@ impl Gfx {
                         self.shapes_layout,
                     );
                     self.pipeline_layout = pipes.layout;
-                    self.pipeline = pipes.atlas;
-                    self.pipeline_image = pipes.image;
-                    self.pipeline_blur = pipes.blur;
-                    self.pipeline_add = pipes.add;
-                    self.pipeline_shape = pipes.shape;
+                    self.pipes = pipes.by_pipe;
                 }
             }
 
@@ -1236,7 +1226,7 @@ impl Gfx {
                     self.device.cmd_bind_pipeline(
                         cmd,
                         vk::PipelineBindPoint::GRAPHICS,
-                        self.pipeline_image,
+                        self.pipes[Pipe::Image as usize],
                     );
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
@@ -1290,7 +1280,7 @@ impl Gfx {
                     self.device.cmd_bind_pipeline(
                         cmd,
                         vk::PipelineBindPoint::GRAPHICS,
-                        self.pipeline_image,
+                        self.pipes[Pipe::Image as usize],
                     );
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
@@ -1512,14 +1502,21 @@ impl Gfx {
                 let kind = run_kind(image, self.blur_depth);
                 // Resolve before recording anything, so a skipped run
                 // leaves no scissor or binding behind.
-                let (pipeline, set) = match kind {
-                    RunKind::Atlas => (self.pipeline, self.desc_set),
-                    RunKind::Add => (self.pipeline_add, self.desc_set),
+                // WHICH pipeline is `pipe_of`'s answer and nothing
+                // else's — a pure function, tested for every kind. What
+                // is left here is which DESCRIPTOR SET goes with it,
+                // which needs the frame's own state and cannot be
+                // decided anywhere but in the middle of recording.
+                let pipeline = self.pipes[pipe_of(kind) as usize];
+                let set = match kind {
                     // fs_shape samples nothing from set 0, but the
                     // shared layout demands one bound; the atlas set is
                     // always alive.
-                    RunKind::Shape => (self.pipeline_shape, self.desc_set),
-                    RunKind::Glass(t) => {
+                    RunKind::Atlas | RunKind::Add | RunKind::Shape => self.desc_set,
+                    // A frosted band reads the pyramid like glass, so it
+                    // binds what glass binds — the pipeline it draws
+                    // with is the one that ALSO reads set 2.
+                    RunKind::ShapeGlass(t) | RunKind::Glass(t) => {
                         if !glass_live {
                             // No blurred scene this frame: the glass
                             // would sample garbage, so it is simply
@@ -1527,12 +1524,12 @@ impl Gfx {
                             return;
                         }
                         match self.blur_targets.get(t) {
-                            Some(bt) => (self.pipeline_blur, bt.desc_set),
+                            Some(bt) => bt.desc_set,
                             None => return,
                         }
                     }
                     RunKind::Image(id) => match self.textures.get(&id) {
-                        Some(tex) => (self.pipeline_image, tex.desc_set),
+                        Some(tex) => tex.desc_set,
                         // The image is gone — or the id is a reserved
                         // instruction this renderer does not know.
                         // Skipping the run beats sampling a stale
@@ -2054,14 +2051,12 @@ impl Drop for Gfx {
                 d.free_memory(t.mem, None);
             }
             d.destroy_render_pass(self.blur_pass, None);
-            d.destroy_pipeline(self.pipeline_blur, None);
-            d.destroy_pipeline(self.pipeline_add, None);
-            d.destroy_pipeline(self.pipeline_shape, None);
             d.destroy_descriptor_pool(self.tex_pool, None);
             d.destroy_descriptor_pool(self.desc_pool, None);
             d.destroy_descriptor_set_layout(self.desc_layout, None);
-            d.destroy_pipeline(self.pipeline_image, None);
-            d.destroy_pipeline(self.pipeline, None);
+            for p in self.pipes {
+                d.destroy_pipeline(p, None);
+            }
             d.destroy_pipeline_layout(self.pipeline_layout, None);
             for fb in self.framebuffers.drain(..) {
                 d.destroy_framebuffer(fb, None);
@@ -2100,23 +2095,43 @@ fn color_range() -> vk::ImageSubresourceRange {
 // state (blur depth, live targets), never against a theme token.
 
 /// Whether a run handle is one of the glass instructions: the three
-/// ranks or the legacy BLUR_IMAGE. All four live in the reserved band,
-/// but the band holds non-glass instructions too — ADD_ATLAS must never
+/// tessellated ranks, the three SHAPE_GLASS lanes of the vector core,
+/// or the legacy BLUR_IMAGE. All seven live in the reserved band, but
+/// the band holds non-glass instructions too — ADD_ATLAS must never
 /// trigger the base-scene split.
+///
+/// The vector lanes belong here for one reason and it is the whole
+/// reason this predicate exists: they SAMPLE the pyramid, so everything
+/// before the first of them is the base scene. A frosted surface drawn
+/// small enough, or drawn during a ride, emits no tessellated core at
+/// all (f3 §3.3) — the band is then the only glass in the frame, and a
+/// classifier that did not know it would leave the pyramid unwritten
+/// and the frost with nothing to read.
 fn is_glass(id: ImageId) -> bool {
     id == nacelle::draw::BLUR_IMAGE
         || id == nacelle::draw::GLASS_RANK_1
         || id == nacelle::draw::GLASS_RANK_2
         || id == nacelle::draw::GLASS_RANK_3
+        || is_shape_glass(id)
 }
 
-/// The rank a glass handle asks for. BLUR_IMAGE aliases rank 2: the
-/// composite used to pick target 2 whenever the depth allowed it, and
-/// the legacy handle must keep producing exactly that picture.
+/// Whether a handle is one of the vector core's frosted lanes — the
+/// band of a frosted surface, drawn through `fs_shape_glass` with both
+/// the record and the blurred scene in hand.
+fn is_shape_glass(id: ImageId) -> bool {
+    id == nacelle::draw::SHAPE_GLASS_1
+        || id == nacelle::draw::SHAPE_GLASS_2
+        || id == nacelle::draw::SHAPE_GLASS_3
+}
+
+/// The rank a glass handle asks for, on either lane. BLUR_IMAGE aliases
+/// rank 2: the composite used to pick target 2 whenever the depth
+/// allowed it, and the legacy handle must keep producing exactly that
+/// picture.
 fn glass_rank(id: ImageId) -> u8 {
-    if id == nacelle::draw::GLASS_RANK_1 {
+    if id == nacelle::draw::GLASS_RANK_1 || id == nacelle::draw::SHAPE_GLASS_1 {
         1
-    } else if id == nacelle::draw::GLASS_RANK_3 {
+    } else if id == nacelle::draw::GLASS_RANK_3 || id == nacelle::draw::SHAPE_GLASS_3 {
         3
     } else {
         2
@@ -2162,6 +2177,10 @@ enum RunKind {
     Add,
     /// The vector core: fs_shape over the set-2 records.
     Shape,
+    /// The vector core's FROSTED band (f3 §3.3): fs_shape_glass over
+    /// the set-2 records AND the pyramid target the run's rank resolves
+    /// to. The one kind that reads both.
+    ShapeGlass(usize),
     /// Glass, resolved to a pyramid target index.
     Glass(usize),
     Image(u32),
@@ -2172,8 +2191,79 @@ fn run_kind(image: Option<ImageId>, blur_depth: u32) -> RunKind {
         None => RunKind::Atlas,
         Some(id) if id == nacelle::draw::ADD_ATLAS => RunKind::Add,
         Some(id) if id == nacelle::draw::SHAPE => RunKind::Shape,
+        Some(id) if is_shape_glass(id) => {
+            RunKind::ShapeGlass(glass_target(glass_rank(id), blur_depth))
+        }
         Some(id) if is_glass(id) => RunKind::Glass(glass_target(glass_rank(id), blur_depth)),
         Some(id) => RunKind::Image(id.0),
+    }
+}
+
+/// One graphics pipeline of this renderer, BY NAME — and the index of
+/// its handle in [`Gfx::pipes`] and in the array `create_pipeline`
+/// builds, which are the same order because this enum is what orders
+/// both.
+///
+/// It exists so that "which pipeline does this run draw with" can be
+/// answered by a function a test can call. A `vk::Pipeline` is an
+/// opaque device handle: nothing outside a live GPU can tell one from
+/// another, so a branch that picks the wrong one is invisible to every
+/// test in this crate — which is exactly what happened to the frosted
+/// band's branch when it lived inside `record_runs`.
+///
+/// The discriminants are the array indices, and `create_pipeline` fills
+/// its create-infos BY NAME at the same indices, so the numbers below
+/// are free to move: handle and lookup move together. What is left
+/// unguarded is one pairing per line there — which stage array each
+/// create-info takes, and so which fragment entry point it compiles.
+/// That one only a screen can answer, and it is a whole pipeline
+/// wrong rather than one lane of one surface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(usize)]
+enum Pipe {
+    /// fs_main, normal blend: the atlas lane every glyph and solid fill
+    /// rides.
+    Atlas = 0,
+    /// fs_image: the texture IS the colour. Also the pyramid's own
+    /// downsample and upsample passes.
+    Image = 1,
+    /// fs_blur: the blurred scene, sampled by screen position.
+    Blur = 2,
+    /// fs_main under SRC_ALPHA/ONE colour, ZERO/ONE alpha: runs tagged
+    /// ADD_ATLAS compose with light. Destination alpha stays untouched,
+    /// which is what a passthrough swapchain will need (r1 R1/R8).
+    Add = 3,
+    /// fs_shape, normal blend: the vector core's lane. Dead code by
+    /// intent until libnacelle's `render.vector` arms the SHAPE runs —
+    /// nothing in the shipped picture emits them (f3 K1).
+    Shape = 4,
+    /// fs_shape_glass, normal blend: the same lane for a FROSTED band,
+    /// the one pipeline that binds a pyramid target AND reads the shape
+    /// records (f3 §3.3, K3b). Dead behind the same switch.
+    ShapeGlass = 5,
+}
+
+impl Pipe {
+    /// How many there are — the length of every array indexed by one.
+    const N: usize = 6;
+}
+
+/// Which pipeline draws a run of this kind.
+///
+/// The frosted band is the whole reason this is a function: it binds
+/// what glass binds and draws with what shape draws, so it is the one
+/// kind whose set and whose pipeline come from different places. Sent
+/// down `Blur` it would sample the pyramid with a fragment that reads
+/// no record — the surface would lose its silhouette and paint its
+/// whole quad, corners, margin and all.
+fn pipe_of(kind: RunKind) -> Pipe {
+    match kind {
+        RunKind::Atlas => Pipe::Atlas,
+        RunKind::Add => Pipe::Add,
+        RunKind::Shape => Pipe::Shape,
+        RunKind::ShapeGlass(_) => Pipe::ShapeGlass,
+        RunKind::Glass(_) => Pipe::Blur,
+        RunKind::Image(_) => Pipe::Image,
     }
 }
 
@@ -2292,20 +2382,12 @@ fn create_blur_pass(device: &ash::Device, format: vk::Format) -> vk::RenderPass 
 /// and the two passes match.
 struct Pipelines {
     layout: vk::PipelineLayout,
-    /// fs_main, straight alpha: text and solid shapes over the atlas.
-    atlas: vk::Pipeline,
-    /// fs_image: the texture IS the colour.
-    image: vk::Pipeline,
-    /// fs_blur: the blurred scene, sampled by screen position.
-    blur: vk::Pipeline,
-    /// fs_main again, additive: SRC_ALPHA/ONE on colour so glow adds
-    /// light; ZERO/ONE on alpha so destination alpha stays untouched,
-    /// which matters under a passthrough swapchain (r1 R1).
-    add: vk::Pipeline,
-    /// fs_shape, straight alpha: the vector core over the set-2
-    /// records. Same blend as the atlas — a shape covers, glow's
-    /// additive lane is K3's.
-    shape: vk::Pipeline,
+    /// The six handles indexed by [`Pipe`] — what each one draws is
+    /// written at the enum, once, rather than beside every field that
+    /// would otherwise hold it. The create-infos below are filled in at
+    /// the index their own name resolves to, so this array and every
+    /// lookup against it stay in step by construction.
+    by_pipe: [vk::Pipeline; Pipe::N],
 }
 
 fn create_pipeline(
@@ -2329,6 +2411,7 @@ fn create_pipeline(
         let fs_image_entry = CStr::from_bytes_with_nul(b"fs_image\0").unwrap();
         let fs_blur_entry = CStr::from_bytes_with_nul(b"fs_blur\0").unwrap();
         let fs_shape_entry = CStr::from_bytes_with_nul(b"fs_shape\0").unwrap();
+        let fs_shape_glass_entry = CStr::from_bytes_with_nul(b"fs_shape_glass\0").unwrap();
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -2368,6 +2451,16 @@ fn create_pipeline(
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(shader_mod)
                 .name(fs_shape_entry),
+        ];
+        let stages_shape_glass = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(shader_mod)
+                .name(vs_entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(shader_mod)
+                .name(fs_shape_glass_entry),
         ];
 
         let bindings = [vk::VertexInputBindingDescription::default()
@@ -2505,6 +2598,18 @@ fn create_pipeline(
             .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
+        let info_shape_glass = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages_shape_glass)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
         let info_shape = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages_shape)
             .vertex_input_state(&vertex_input)
@@ -2517,22 +2622,30 @@ fn create_pipeline(
             .layout(layout)
             .render_pass(render_pass)
             .subpass(0);
+        // The create-infos go in at the INDEX THEIR NAME RESOLVES TO,
+        // not in the order they happen to be written: `Gfx` looks a
+        // pipeline up by the same name, so a discriminant moved in the
+        // enum moves the handle and the lookup together and the picture
+        // does not change. Nothing in this crate can tell two
+        // `vk::Pipeline`s apart — the only defence against binding the
+        // wrong one is not needing to check.
+        let mut infos = [vk::GraphicsPipelineCreateInfo::default(); Pipe::N];
+        infos[Pipe::Atlas as usize] = info;
+        infos[Pipe::Image as usize] = info_image;
+        infos[Pipe::Blur as usize] = info_blur;
+        infos[Pipe::Add as usize] = info_add;
+        infos[Pipe::Shape as usize] = info_shape;
+        infos[Pipe::ShapeGlass as usize] = info_shape_glass;
         let pipelines = device
-            .create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[info, info_image, info_blur, info_add, info_shape],
-                None,
-            )
+            .create_graphics_pipelines(vk::PipelineCache::null(), &infos, None)
             .expect("cannot create pipelines");
 
         device.destroy_shader_module(shader_mod, None);
         Pipelines {
             layout,
-            atlas: pipelines[0],
-            image: pipelines[1],
-            blur: pipelines[2],
-            add: pipelines[3],
-            shape: pipelines[4],
+            by_pipe: pipelines
+                .try_into()
+                .expect("the device returned a pipeline per create-info"),
         }
     }
 }
@@ -2729,11 +2842,12 @@ fn create_host_buffer(
 #[cfg(test)]
 mod tests {
     use super::{
-        glass_rank, glass_target, is_glass, parse_cube, pyramid_steps, run_kind, scissor_for,
-        RunKind,
+        glass_rank, glass_target, is_glass, parse_cube, pipe_of, pyramid_steps, run_kind,
+        scissor_for, Pipe, RunKind,
     };
     use nacelle::draw::{
         ImageId, ADD_ATLAS, BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3, SHAPE,
+        SHAPE_GLASS_1, SHAPE_GLASS_2, SHAPE_GLASS_3,
     };
 
     /// The base-scene split triggers on glass and only on glass: the
@@ -2744,11 +2858,82 @@ mod tests {
         for id in [BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3] {
             assert!(is_glass(id), "{id:?} must count as glass");
         }
+        // The vector core's frosted lanes count too, and they have to:
+        // a small frosted surface, or one drawn during a ride, emits no
+        // tessellated core at all (f3 §3.3) — its band is then the only
+        // glass in the frame, and a split that did not fire would leave
+        // the pyramid unwritten under a fragment that samples it.
+        for id in [SHAPE_GLASS_1, SHAPE_GLASS_2, SHAPE_GLASS_3] {
+            assert!(is_glass(id), "{id:?} samples the pyramid and must split the scene");
+        }
         assert!(!is_glass(ADD_ATLAS));
         assert!(!is_glass(SHAPE), "the vector lane covers, it is not glass");
         assert!(!is_glass(ImageId(u32::MAX - 9)));
         assert!(!is_glass(ImageId(0)));
         assert!(!is_glass(ImageId(7)));
+    }
+
+    /// **Which fragment draws a run.** This decision used to sit in the
+    /// middle of `record_runs`, between a scissor and a bind, where a
+    /// test could not reach it at all — a `vk::Pipeline` is an opaque
+    /// device handle, so a branch that picked the wrong one was correct
+    /// as far as everything in this crate could tell, and wrong on the
+    /// screen. Now the decision is a name and this is the test of it.
+    ///
+    /// The frosted band is the case that made it worth moving. It binds
+    /// what glass binds and reads what a shape reads, so it is the one
+    /// kind whose descriptor set and whose pipeline come from different
+    /// places — and sent down `Blur` it would sample the pyramid with a
+    /// fragment that reads no record: the surface would lose its
+    /// silhouette and paint its whole quad, corners, margin and all.
+    #[test]
+    fn every_run_kind_names_the_fragment_that_can_draw_it() {
+        assert_eq!(pipe_of(RunKind::Atlas), Pipe::Atlas);
+        assert_eq!(pipe_of(RunKind::Add), Pipe::Add);
+        assert_eq!(pipe_of(RunKind::Shape), Pipe::Shape);
+        assert_eq!(pipe_of(RunKind::Image(7)), Pipe::Image);
+        for t in 0..3 {
+            assert_eq!(pipe_of(RunKind::Glass(t)), Pipe::Blur);
+            assert_eq!(pipe_of(RunKind::ShapeGlass(t)), Pipe::ShapeGlass);
+        }
+        // …and from the HANDLE the toolkit actually writes, which is
+        // the whole road: a rank's band ends at the frosted fragment
+        // and its core at the plain blur, from the same frame.
+        assert_eq!(pipe_of(run_kind(Some(SHAPE_GLASS_2), 3)), Pipe::ShapeGlass);
+        assert_eq!(pipe_of(run_kind(Some(GLASS_RANK_2), 3)), Pipe::Blur);
+        assert_eq!(pipe_of(run_kind(Some(SHAPE), 3)), Pipe::Shape);
+        assert_eq!(pipe_of(run_kind(None, 3)), Pipe::Atlas);
+        // The names index an array, so two of them sharing a slot would
+        // bind one pipeline for two kinds — silently, and only on the
+        // lane that lost.
+        let all = [Pipe::Atlas, Pipe::Image, Pipe::Blur, Pipe::Add, Pipe::Shape, Pipe::ShapeGlass];
+        let mut slots: Vec<usize> = all.iter().map(|p| *p as usize).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..Pipe::N).collect::<Vec<_>>());
+    }
+
+    /// A frosted surface is drawn in two pieces — the core through
+    /// `GLASS_RANK_n`, the band through `SHAPE_GLASS_n` — and they must
+    /// land on the SAME pyramid target at every depth. A mismatch would
+    /// not crash and would not fail to draw: it would put one blur
+    /// inside the surface and another around its rim, which is the
+    /// stair-step defect K3b removed, wearing a different hat.
+    #[test]
+    fn the_band_and_the_core_of_one_rank_sample_one_target() {
+        for depth in 1..=3u32 {
+            for (tess, field) in [
+                (GLASS_RANK_1, SHAPE_GLASS_1),
+                (GLASS_RANK_2, SHAPE_GLASS_2),
+                (GLASS_RANK_3, SHAPE_GLASS_3),
+            ] {
+                assert_eq!(glass_rank(tess), glass_rank(field), "{tess:?} vs {field:?}");
+                assert_eq!(
+                    run_kind(Some(field), depth),
+                    RunKind::ShapeGlass(glass_target(glass_rank(tess), depth)),
+                    "depth {depth}: the band left its core behind"
+                );
+            }
+        }
     }
 
     /// rank 1 -> target 1 always; rank 2 -> 2 when written, else 1;
@@ -2828,6 +3013,15 @@ mod tests {
         assert_eq!(run_kind(Some(GLASS_RANK_2), 3), RunKind::Glass(2));
         assert_eq!(run_kind(Some(GLASS_RANK_3), 3), RunKind::Glass(3));
         assert_eq!(run_kind(Some(GLASS_RANK_3), 1), RunKind::Glass(1));
+        // The frosted band is its OWN kind: it binds what glass binds
+        // and draws with the pipeline that also reads set 2. Classified
+        // as plain Glass it would draw through `fs_blur`, which reads
+        // no record — the surface would lose its silhouette and paint
+        // its whole quad, corners and all.
+        assert_eq!(run_kind(Some(SHAPE_GLASS_1), 3), RunKind::ShapeGlass(1));
+        assert_eq!(run_kind(Some(SHAPE_GLASS_2), 3), RunKind::ShapeGlass(2));
+        assert_eq!(run_kind(Some(SHAPE_GLASS_3), 3), RunKind::ShapeGlass(3));
+        assert_eq!(run_kind(Some(SHAPE_GLASS_3), 1), RunKind::ShapeGlass(1));
         assert_eq!(run_kind(Some(ImageId(7)), 3), RunKind::Image(7));
         assert_eq!(
             run_kind(Some(ImageId(u32::MAX - 9)), 3),
