@@ -3,7 +3,7 @@ name = "nacelle-renderer"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
-description = "The Vulkan renderer of the nacelle project: two pipelines over one vertex stream (glyph atlas + registered RGBA images), swapchain bit depth up to sixteen, and a 3D grading LUT"
+description = "The Vulkan renderer of the nacelle project: seven pipelines over one vertex stream (glyph atlas, registered RGBA images, frosted glass, additive atlas, and the shape lane with its frosted and additive siblings), swapchain bit depth up to sixteen, and a 3D grading LUT"
 license = "MIT"
 repository = "https://github.com/JOCKER3201/nacelle-renderer"
 

@@ -1,18 +1,24 @@
-//! Vulkan renderer (ash) — six pipelines over one vertex stream: the
+//! Vulkan renderer (ash) — SEVEN pipelines over one vertex stream: the
 //! atlas one (text and solid shapes, R8 coverage), the image one
 //! (application-registered RGBA textures), the frosted-glass one (the
 //! scene beneath, pre-rendered and blurred, sampled at one of three
 //! pyramid ranks), the additive one (fs_main again under
 //! SRC_ALPHA/ONE, so glow adds light instead of filming over it) and
 //! the shape one (the vector core: an analytic distance field over
-//! set 2's records, one quad per silhouette) and its ADDITIVE twin,
-//! which is the same fragment under the same blend the atlas glow
-//! uses — because a glow adds light and that is a property of the
-//! pipeline, not of the record. The draw list's runs say which is
-//! which, in emission order, each run under its own scissor.
+//! set 2's records, one quad per silhouette) with its FROSTED sibling
+//! (fs_shape_glass — the one fragment that binds a pyramid target and
+//! reads a record) and its ADDITIVE twin, which is the same fragment
+//! under the same blend the atlas glow uses — because a glow adds
+//! light and that is a property of the pipeline, not of the record.
+//! The draw list's runs say which is which, in emission order, each
+//! run under its own scissor.
+//!
+//! The count above said "six" until the frosted sibling was counted;
+//! [`Pipe::N`] is the number that decides, and `the_advertised_pipeline_count_is_the_one_the_device_gets`
+//! is what keeps the prose from drifting off it again.
 
 use ash::vk;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use std::collections::HashMap;
 use std::ffi::CStr;
 
@@ -72,6 +78,120 @@ struct Texture {
     /// Whether the image has ever been filled — decides the first
     /// barrier's source layout.
     initialized: bool,
+}
+
+/// Why the renderer could not be built.
+///
+/// Every one of these is a MACHINE that cannot draw, not a program that
+/// is wrong: no Vulkan library installed, no GPU that can both draw and
+/// present to this window, a driver that refused an object. The answer
+/// to all of them is the same — say so and leave — and a caller cannot
+/// say anything at all about a panic that already unwound past it.
+///
+/// The line between this type and the panics still standing in this
+/// file is exactly that: a panic is reserved for a program that asked
+/// for something impossible, an error for a machine that cannot give
+/// something possible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GfxError {
+    /// The window handed out no raw handle to build a surface from.
+    NoWindowHandle,
+    /// The Vulkan loader could not open the library — the usual
+    /// meaning is that no driver is installed.
+    NoVulkanLibrary,
+    /// This Vulkan has no surface extension for the display server the
+    /// process is running under.
+    NoSurfaceExtension,
+    /// The instance itself was refused.
+    NoInstance(vk::Result),
+    /// A surface could not be made for this window.
+    NoSurface(vk::Result),
+    /// No physical device can both draw and present here.
+    NoDevice,
+    /// The logical device was refused.
+    NoLogicalDevice(vk::Result),
+    /// The surface answered nothing when asked for its formats.
+    NoFormat(vk::Result),
+    /// Either no memory type on this device satisfies what the named
+    /// object needs, or the allocation was refused.
+    NoMemory(&'static str),
+}
+
+impl std::fmt::Display for GfxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GfxError::NoWindowHandle => write!(f, "the window has no raw handle to draw into"),
+            GfxError::NoVulkanLibrary => {
+                write!(f, "no Vulkan library on this machine (is a driver installed?)")
+            }
+            GfxError::NoSurfaceExtension => {
+                write!(f, "this Vulkan has no surface extension for this display server")
+            }
+            GfxError::NoInstance(e) => write!(f, "Vulkan refused an instance: {e:?}"),
+            GfxError::NoSurface(e) => write!(f, "cannot create a surface for this window: {e:?}"),
+            GfxError::NoDevice => write!(f, "no GPU here can both draw and present to this window"),
+            GfxError::NoLogicalDevice(e) => write!(f, "the GPU refused a logical device: {e:?}"),
+            GfxError::NoFormat(e) => write!(f, "the surface named no format: {e:?}"),
+            GfxError::NoMemory(what) => write!(f, "no GPU memory for the {what}"),
+        }
+    }
+}
+
+impl std::error::Error for GfxError {}
+
+/// What a swapchain call's error means for the next frame.
+///
+/// The whole point of naming these is that only the last one is worth
+/// ending a process over. A swapchain that no longer matches its
+/// surface is the ordinary consequence of a resize; a surface that is
+/// GONE is the ordinary consequence of unplugging a monitor or
+/// restarting a compositor — and neither is a reason for the desktop
+/// to disappear along with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fault {
+    /// The swapchain no longer matches its surface: build another one
+    /// and draw the frame again.
+    Swapchain,
+    /// The surface itself is gone: build a new surface for the same
+    /// window, and a swapchain on top of that.
+    Surface,
+    /// Nothing this renderer knows how to repair.
+    Fatal,
+}
+
+/// Reads a Vulkan result as a [`Fault`].
+///
+/// `SUBOPTIMAL_KHR` is here even though both call sites usually meet it
+/// as a success value (`acquire_next_image` returns it in the tuple,
+/// `queue_present` as `Ok(true)`): a driver is allowed to hand it back
+/// as an error from either, and a renderer that then called it fatal
+/// would die of a picture that was merely stretched.
+fn fault_of(e: vk::Result) -> Fault {
+    match e {
+        vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR => Fault::Swapchain,
+        vk::Result::ERROR_SURFACE_LOST_KHR => Fault::Surface,
+        _ => Fault::Fatal,
+    }
+}
+
+impl Fault {
+    /// Whether the surface has to be built anew before anything else.
+    fn rebuilds_surface(self) -> bool {
+        matches!(self, Fault::Surface)
+    }
+
+    /// Whether the swapchain has to be built anew. A lost surface says
+    /// yes to BOTH questions, and in that order: the swapchain hangs
+    /// off the surface, so one built against a dead surface is dead
+    /// too.
+    fn rebuilds_swapchain(self) -> bool {
+        matches!(self, Fault::Surface | Fault::Swapchain)
+    }
+
+    /// Whether this renderer has any repair for it.
+    fn is_fatal(self) -> bool {
+        matches!(self, Fault::Fatal)
+    }
 }
 
 /// Everything Vulkan keeps at the *process* level: the loaded library,
@@ -136,36 +256,45 @@ static VK: std::sync::OnceLock<Vk> = std::sync::OnceLock::new();
 /// # Safety
 /// Calls into the Vulkan loader; `display_handle` must be a live handle
 /// from the window system this process is actually running under.
-unsafe fn shared(display_handle: RawDisplayHandle) -> &'static Vk {
-    // RawDisplayHandle is Copy, so the closure can capture it outright.
-    VK.get_or_init(|| {
-        let entry = ash::Entry::load().expect("cannot load the Vulkan library");
+unsafe fn shared(display_handle: RawDisplayHandle) -> Result<&'static Vk, GfxError> {
+    // The build is OUTSIDE `get_or_init`, because a machine with no
+    // Vulkan at all has to be able to say so: the closure form can only
+    // return a `Vk`, so its three failure points had nowhere to go but
+    // a panic. Publishing afterwards keeps the "one instance, never
+    // destroyed" property that [`VK`] exists for.
+    if let Some(vk) = VK.get() {
+        return Ok(vk);
+    }
+    let entry = ash::Entry::load().map_err(|_| GfxError::NoVulkanLibrary)?;
 
-        let app_name = CStr::from_bytes_with_nul(b"nacelle-desktop\0").unwrap();
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(app_name)
-            .engine_name(app_name)
-            .api_version(vk::make_api_version(0, 1, 0, 0));
+    let app_name = CStr::from_bytes_with_nul(b"nacelle-desktop\0").unwrap();
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(app_name)
+        .engine_name(app_name)
+        .api_version(vk::make_api_version(0, 1, 0, 0));
 
-        let ext_names = ash_window::enumerate_required_extensions(display_handle)
-            .expect("missing surface extensions")
-            .to_vec();
+    let ext_names = ash_window::enumerate_required_extensions(display_handle)
+        .map_err(|_| GfxError::NoSurfaceExtension)?
+        .to_vec();
 
-        let instance_info = vk::InstanceCreateInfo::default()
-            .application_info(&app_info)
-            .enabled_extension_names(&ext_names);
-        let instance = entry
-            .create_instance(&instance_info, None)
-            .expect("cannot create Vulkan instance");
+    let instance_info = vk::InstanceCreateInfo::default()
+        .application_info(&app_info)
+        .enabled_extension_names(&ext_names);
+    let instance = entry
+        .create_instance(&instance_info, None)
+        .map_err(GfxError::NoInstance)?;
 
-        let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
+    let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
 
-        Vk {
-            entry,
-            instance,
-            surface_loader,
-        }
-    })
+    // If some other thread published first, the one built here is
+    // dropped — which costs an instance handle and nothing more, since
+    // `Vk` has no `Drop` and ash never destroys an instance by itself.
+    // That leak is the same deliberate one [`VK`] is documented for.
+    Ok(VK.get_or_init(move || Vk {
+        entry,
+        instance,
+        surface_loader,
+    }))
 }
 
 pub struct Gfx {
@@ -175,6 +304,17 @@ pub struct Gfx {
     /// destroying it in `Drop` needs the loader right here.
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
+    /// The handles the surface was built from, kept because a surface
+    /// can be LOST — a monitor unplugged, a compositor restarted — and
+    /// the only way back is another surface for the same window.
+    ///
+    /// Keeping them is sound for the same reason the window can be
+    /// borrowed at all: raw handles are plain `Copy` values that borrow
+    /// nothing, and they stay meaningful exactly as long as the
+    /// caller's window does. `Gfx` never outlives that window — it is
+    /// the thing drawing into it.
+    display_handle: RawDisplayHandle,
+    window_handle: RawWindowHandle,
     pdevice: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
@@ -267,6 +407,11 @@ pub struct Gfx {
     sem_render: vk::Semaphore,
     fence: vk::Fence,
     needs_recreate: bool,
+    /// The surface itself is gone and has to be built again before the
+    /// swapchain can be. Separate from `needs_recreate` because the two
+    /// repairs are ordered: every lost surface also costs a swapchain,
+    /// but no resize costs a surface.
+    needs_surface: bool,
     /// GPU timestamps, per pass, when `NACELLE_GPU_TIMING` asks for
     /// them. `None` — the default — is not a disabled instrument but
     /// no instrument at all: no query pool, no windows, no branch that
@@ -278,19 +423,37 @@ impl Gfx {
     /// Builds the renderer for a surface described by raw handles.
     /// `width`/`height` are the surface's pixel size right now; the
     /// swapchain follows [`Gfx::render`]'s sizes from then on.
+    ///
+    /// Fails instead of panicking on everything the MACHINE decides:
+    /// no Vulkan library, no GPU that can present here, a driver that
+    /// refuses the device or the memory. A caller that gets an
+    /// [`GfxError`] can print one sentence and exit; a caller that got
+    /// the old `expect` could only watch a stack trace go by.
+    ///
+    /// A caller may also NOT exit — a desktop that cannot build one of
+    /// its screens goes on drawing the others — and that is why every
+    /// failing path here gives back what it had already taken. See
+    /// [`Gfx::furnish`] for the half of the construction that fails
+    /// into a `Drop` instead of by name.
     pub fn new(
         handle: &(impl HasDisplayHandle + HasWindowHandle),
         width: u32,
         height: u32,
-    ) -> Self {
+    ) -> Result<Self, GfxError> {
         unsafe {
-            let display_handle = handle.display_handle().unwrap().as_raw();
-            let window_handle = handle.window_handle().unwrap().as_raw();
+            let display_handle = handle
+                .display_handle()
+                .map_err(|_| GfxError::NoWindowHandle)?
+                .as_raw();
+            let window_handle = handle
+                .window_handle()
+                .map_err(|_| GfxError::NoWindowHandle)?
+                .as_raw();
 
             // The library, the instance and the surface loader belong to
             // the process, not to this screen — see [`VK`] for the crash
             // that taught us so.
-            let vk = shared(display_handle);
+            let vk = shared(display_handle)?;
 
             let surface = ash_window::create_surface(
                 &vk.entry,
@@ -299,30 +462,41 @@ impl Gfx {
                 window_handle,
                 None,
             )
-            .expect("cannot create window surface");
+            .map_err(GfxError::NoSurface)?;
             let surface_loader = vk.surface_loader.clone();
 
             // GPU + queue family selection (graphics + present).
-            let pdevices = vk
-                .instance
-                .enumerate_physical_devices()
-                .expect("no Vulkan devices");
-            let (pdevice, queue_family) = pdevices
-                .iter()
-                .find_map(|&pd| {
-                    vk.instance
-                        .get_physical_device_queue_family_properties(pd)
-                        .iter()
-                        .enumerate()
-                        .find_map(|(i, props)| {
-                            let ok = props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                                && surface_loader
-                                    .get_physical_device_surface_support(pd, i as u32, surface)
-                                    .unwrap_or(false);
-                            if ok { Some((pd, i as u32)) } else { None }
-                        })
-                })
-                .expect("no GPU with graphics and present support");
+            //
+            // The three exits in this stretch destroy the surface BY
+            // NAME, and they are the only ones that have to: until the
+            // logical device exists there is no `Gfx` to hang the
+            // handle on, so there is no `Drop` to run. Everything from
+            // the device onwards belongs to [`Gfx::furnish`], which
+            // fails into that `Drop` instead.
+            let pdevices = match vk.instance.enumerate_physical_devices() {
+                Ok(p) => p,
+                Err(_) => {
+                    surface_loader.destroy_surface(surface, None);
+                    return Err(GfxError::NoDevice);
+                }
+            };
+            let picked = pdevices.iter().find_map(|&pd| {
+                vk.instance
+                    .get_physical_device_queue_family_properties(pd)
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, props)| {
+                        let ok = props.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                            && surface_loader
+                                .get_physical_device_surface_support(pd, i as u32, surface)
+                                .unwrap_or(false);
+                        if ok { Some((pd, i as u32)) } else { None }
+                    })
+            });
+            let Some((pdevice, queue_family)) = picked else {
+                surface_loader.destroy_surface(surface, None);
+                return Err(GfxError::NoDevice);
+            };
 
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default()
@@ -332,404 +506,496 @@ impl Gfx {
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&dev_exts);
-            let device = vk
-                .instance
-                .create_device(pdevice, &device_info, None)
-                .expect("cannot create logical device");
+            let device = match vk.instance.create_device(pdevice, &device_info, None) {
+                Ok(d) => d,
+                Err(e) => {
+                    surface_loader.destroy_surface(surface, None);
+                    return Err(GfxError::NoLogicalDevice(e));
+                }
+            };
             let queue = device.get_device_queue(queue_family, 0);
             // Unlike the surface loader, this one stays per `Gfx`: its
             // pointers come from `get_device_proc_addr`, so they belong
             // to this screen's device and to no other.
             let swapchain_loader = ash::khr::swapchain::Device::new(&vk.instance, &device);
-
-            // Surface format: the depth preference decides later, at
-            // recreate; the start is the plain eight-bit UNORM path.
-            let formats = surface_loader
-                .get_physical_device_surface_formats(pdevice, surface)
-                .unwrap();
-            let format = pick_format(&formats, 8);
-
-            let render_pass = create_render_pass(&device, format.format);
-            let blur_pass = create_blur_pass(&device, format.format);
-
-            // Descriptors: atlas texture (binding 0) + sampler (binding 1),
-            // because WGSL has no combined image sampler.
-            let bindings = [
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            ];
-            let desc_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-                    None,
-                )
-                .unwrap();
-            let pool_sizes = [
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1),
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1),
-            ];
-            let desc_pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&pool_sizes),
-                    None,
-                )
-                .unwrap();
-            let layouts = [desc_layout];
-            let desc_set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(desc_pool)
-                        .set_layouts(&layouts),
-                )
-                .unwrap()[0];
-
-            // The grading LUT lives in its own set (group 1): the
-            // atlas set and every image set share group 0's layout,
-            // and the LUT must not have to be written into each.
-            let lut_bindings = [
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                vk::DescriptorSetLayoutBinding::default()
-                    .binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(1)
-                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            ];
-            let lut_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&lut_bindings),
-                    None,
-                )
-                .unwrap();
-
-            // Set 2: the shape records (f3 D4). Set 0 is repinned per
-            // run — a texture and a pyramid target each own a set — so
-            // the one frame-wide storage buffer gets its own group, its
-            // own layout and its own one-set pool; the existing pools
-            // hold only SAMPLED_IMAGE and SAMPLER counts (R5).
-            let shapes_bindings = [vk::DescriptorSetLayoutBinding::default()
-                .binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-            let shapes_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&shapes_bindings),
-                    None,
-                )
-                .unwrap();
-            let shapes_pool_sizes = [vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)];
-            let shapes_pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(1)
-                        .pool_sizes(&shapes_pool_sizes),
-                    None,
-                )
-                .unwrap();
-            let shapes_layouts = [shapes_layout];
-            let shapes_set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(shapes_pool)
-                        .set_layouts(&shapes_layouts),
-                )
-                .unwrap()[0];
-
-            let pipes =
-                create_pipeline(&device, render_pass, desc_layout, lut_layout, shapes_layout);
-
-            // Room for the application's images: browser frames,
-            // previews, a wallpaper. Freed individually as images go.
-            let tex_pool_sizes = [
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLED_IMAGE)
-                    .descriptor_count(96),
-                vk::DescriptorPoolSize::default()
-                    .ty(vk::DescriptorType::SAMPLER)
-                    .descriptor_count(96),
-            ];
-            let tex_pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-                        .max_sets(96)
-                        .pool_sizes(&tex_pool_sizes),
-                    None,
-                )
-                .unwrap();
-
             let mem_props = vk.instance.get_physical_device_memory_properties(pdevice);
 
-            // The identity LUT: two voxels an edge, each the colour of
-            // its own corner. Present from the first frame so the
-            // pipeline layout never has an unbound set; replaced in
-            // place when a .cube is chosen.
-            let (lut_image, lut_mem, lut_view) =
-                create_lut_image(&device, &mem_props, 2);
-            let lut_set_layouts = [lut_layout];
-            let lut_set = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(tex_pool)
-                        .set_layouts(&lut_set_layouts),
-                )
-                .unwrap()[0];
-
-            // Glyph atlas: R8, device-local.
-            let atlas_info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::R8_UNORM)
-                .extent(vk::Extent3D {
-                    width: ATLAS_W as u32,
-                    height: ATLAS_H as u32,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                .initial_layout(vk::ImageLayout::UNDEFINED);
-            let atlas_image = device.create_image(&atlas_info, None).unwrap();
-            let req = device.get_image_memory_requirements(atlas_image);
-            let atlas_mem = alloc_memory(
-                &device,
-                &mem_props,
-                req,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
-            device.bind_image_memory(atlas_image, atlas_mem, 0).unwrap();
-            let atlas_view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(atlas_image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8_UNORM)
-                        .subresource_range(color_range()),
-                    None,
-                )
-                .unwrap();
-
-            let sampler = device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .mag_filter(vk::Filter::LINEAR)
-                        .min_filter(vk::Filter::LINEAR)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .unwrap();
-
-            let tex_info = [vk::DescriptorImageInfo::default()
-                .image_view(atlas_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let samp_info = [vk::DescriptorImageInfo::default().sampler(sampler)];
-            let writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(desc_set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&tex_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(desc_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&samp_info),
-            ];
-            device.update_descriptor_sets(&writes, &[]);
-            let lut_tex_info = [vk::DescriptorImageInfo::default()
-                .image_view(lut_view)
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-            let lut_writes = [
-                vk::WriteDescriptorSet::default()
-                    .dst_set(lut_set)
-                    .dst_binding(0)
-                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                    .image_info(&lut_tex_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(lut_set)
-                    .dst_binding(1)
-                    .descriptor_type(vk::DescriptorType::SAMPLER)
-                    .image_info(&samp_info),
-            ];
-            device.update_descriptor_sets(&lut_writes, &[]);
-
-            // Staging buffer for atlas uploads.
-            let (staging_buf, staging_mem, staging_ptr) = create_host_buffer(
-                &device,
-                &mem_props,
-                (ATLAS_W * ATLAS_H) as u64,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-            );
-
-            // Vertex buffer (host-visible, persistently mapped).
-            let (vertex_buf, vertex_mem, vertex_ptr) = create_host_buffer(
-                &device,
-                &mem_props,
-                (MAX_VERTS * std::mem::size_of::<Vertex>()) as u64,
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-            );
-
-            // Shape records: the same persistent mapping, written each
-            // frame beside the vertices, read by fs_shape through set 2.
-            let (shapes_buf, shapes_mem, shapes_ptr) = create_host_buffer(
-                &device,
-                &mem_props,
-                (MAX_SHAPES * std::mem::size_of::<Shape>()) as u64,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-            );
-            let shapes_buf_info = [vk::DescriptorBufferInfo::default()
-                .buffer(shapes_buf)
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
-            let shapes_write = [vk::WriteDescriptorSet::default()
-                .dst_set(shapes_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&shapes_buf_info)];
-            device.update_descriptor_sets(&shapes_write, &[]);
-
-            let cmd_pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(queue_family)
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                    None,
-                )
-                .unwrap();
-            let cmd_buf = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .unwrap()[0];
-
-            let sem_image = device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .unwrap();
-            let sem_render = device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .unwrap();
-            let fence = device
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-                .unwrap();
-
-            // GPU timing, only if asked for. Two device facts decide
-            // whether it can work at all: the length of a tick
-            // (`timestampPeriod`, nanoseconds) and how many bits of a
-            // timestamp this queue family actually fills
-            // (`timestampValidBits`). The family is asked rather than
-            // the device-wide `timestampComputeAndGraphics`, because
-            // the family's answer is the exact one for the queue the
-            // frames go to; the device-wide promise is only reported.
-            let limits = vk.instance.get_physical_device_properties(pdevice).limits;
-            let valid_bits = vk
-                .instance
-                .get_physical_device_queue_family_properties(pdevice)
-                .get(queue_family as usize)
-                .map(|q| q.timestamp_valid_bits)
-                .unwrap_or(0);
-            let timing = GpuTiming::from_env(
-                &device,
-                limits.timestamp_period,
-                valid_bits,
-                limits.timestamp_compute_and_graphics == vk::TRUE,
-                FRAMES_IN_FLIGHT,
-            );
-
+            // The renderer exists from this line on, and it is EMPTY:
+            // every handle null, every list empty, no format chosen.
+            // Null is what makes that safe to drop — `vkDestroy*` and
+            // `vkFree*` take a null handle and do nothing — and being
+            // droppable is the whole point, because it is what the rest
+            // of the construction fails INTO.
             let mut gfx = Gfx {
                 surface_loader,
                 surface,
+                display_handle,
+                window_handle,
                 pdevice,
                 device,
                 queue,
                 swapchain_loader,
                 swapchain: vk::SwapchainKHR::null(),
-                format,
+                format: vk::SurfaceFormatKHR::default(),
                 extent: vk::Extent2D { width: 0, height: 0 },
                 images: vec![],
                 views: vec![],
-                render_pass,
+                render_pass: vk::RenderPass::null(),
                 framebuffers: vec![],
-                pipeline_layout: pipes.layout,
-                pipes: pipes.by_pipe,
-                blur_pass,
+                pipeline_layout: vk::PipelineLayout::null(),
+                pipes: [vk::Pipeline::null(); Pipe::N],
+                blur_pass: vk::RenderPass::null(),
                 blur_targets: Vec::new(),
                 blur_depth: 3,
                 text_gamma: 1.0,
-                desc_layout,
-                desc_pool,
-                desc_set,
-                tex_pool,
+                desc_layout: vk::DescriptorSetLayout::null(),
+                desc_pool: vk::DescriptorPool::null(),
+                desc_set: vk::DescriptorSet::null(),
+                tex_pool: vk::DescriptorPool::null(),
                 textures: HashMap::new(),
                 next_tex: 1,
                 retired: Vec::new(),
                 mem_props,
                 depth_pref: 8,
-                lut_layout,
-                lut_set,
-                lut_image,
-                lut_mem,
-                lut_view,
+                lut_layout: vk::DescriptorSetLayout::null(),
+                lut_set: vk::DescriptorSet::null(),
+                lut_image: vk::Image::null(),
+                lut_mem: vk::DeviceMemory::null(),
+                lut_view: vk::ImageView::null(),
                 lut_size: 0,
                 lut_pending: Some((2, identity_lut(2))),
                 lut_initialized: false,
-                sampler,
-                atlas_image,
-                atlas_mem,
-                atlas_view,
+                sampler: vk::Sampler::null(),
+                atlas_image: vk::Image::null(),
+                atlas_mem: vk::DeviceMemory::null(),
+                atlas_view: vk::ImageView::null(),
                 atlas_initialized: false,
                 pending_atlas_rows: None,
-                staging_buf,
-                staging_mem,
-                staging_ptr,
-                vertex_buf,
-                vertex_mem,
-                vertex_ptr,
-                shapes_layout,
-                shapes_pool,
-                shapes_set,
-                shapes_buf,
-                shapes_mem,
-                shapes_ptr,
-                cmd_pool,
-                cmd_buf,
-                sem_image,
-                sem_render,
-                fence,
+                staging_buf: vk::Buffer::null(),
+                staging_mem: vk::DeviceMemory::null(),
+                staging_ptr: std::ptr::null_mut(),
+                vertex_buf: vk::Buffer::null(),
+                vertex_mem: vk::DeviceMemory::null(),
+                vertex_ptr: std::ptr::null_mut(),
+                shapes_layout: vk::DescriptorSetLayout::null(),
+                shapes_pool: vk::DescriptorPool::null(),
+                shapes_set: vk::DescriptorSet::null(),
+                shapes_buf: vk::Buffer::null(),
+                shapes_mem: vk::DeviceMemory::null(),
+                shapes_ptr: std::ptr::null_mut(),
+                cmd_pool: vk::CommandPool::null(),
+                cmd_buf: vk::CommandBuffer::null(),
+                sem_image: vk::Semaphore::null(),
+                sem_render: vk::Semaphore::null(),
+                fence: vk::Fence::null(),
                 needs_recreate: false,
-                timing,
+                needs_surface: false,
+                timing: None,
             };
+
+            // This `?` is the whole reason the construction is in two
+            // halves: it drops `gfx`, and that drop destroys the device
+            // and the surface together with whatever `furnish` had
+            // already managed to build.
+            gfx.furnish(vk, queue_family)?;
             gfx.recreate_swapchain(width, height);
-            gfx
+            Ok(gfx)
         }
+    }
+
+    /// Fills the empty renderer in: the format, the render passes, the
+    /// descriptor plumbing, the pipelines, the glyph atlas, the mapped
+    /// buffers, the command pool and the sync objects.
+    ///
+    /// WHY THIS IS A SECOND STEP and not simply the rest of
+    /// [`Gfx::new`]: six of the steps below can fail on a machine that
+    /// has no memory for what they ask, and turning those panics into
+    /// errors would have MOVED the fault rather than repaired it. A
+    /// `?` out of the middle of a constructor drops nothing — the
+    /// struct whose `Drop` destroys the device does not exist yet — so
+    /// each of those exits would have leaked a `VkDevice` and a
+    /// `VkSurfaceKHR`, and with them the render passes, pipelines,
+    /// pools, sampler and atlas image made before the failing line.
+    /// Under the panics that came before, that cost nothing: the
+    /// process ended and the kernel swept up. It costs everything for a
+    /// caller that goes ON — a desktop skipping the one screen it
+    /// cannot draw on is exactly the caller this branch exists for,
+    /// and it would have leaked a device per unusable monitor.
+    ///
+    /// Filling an already-built `Gfx` gives every one of those failures
+    /// the same exit and the same cleanup: the caller's `?` drops the
+    /// half-built renderer, and [`Gfx`]'s `Drop` destroys precisely the
+    /// handles that got made. The rest are still null, which every
+    /// `vkDestroy*` and `vkFree*` accepts and ignores.
+    ///
+    /// # Safety
+    /// Vulkan calls throughout. `vk` must be the instance this `Gfx`'s
+    /// device was created from, and `queue_family` the family its queue
+    /// was taken from.
+    unsafe fn furnish(&mut self, vk: &Vk, queue_family: u32) -> Result<(), GfxError> {
+        // Surface format: the depth preference decides later, at
+        // recreate; the start is the plain eight-bit UNORM path.
+        let formats = self
+            .surface_loader
+            .get_physical_device_surface_formats(self.pdevice, self.surface)
+            .map_err(GfxError::NoFormat)?;
+        self.format = pick_format(&formats, 8);
+
+        self.render_pass = create_render_pass(&self.device, self.format.format);
+        self.blur_pass = create_blur_pass(&self.device, self.format.format);
+
+        // Descriptors: atlas texture (binding 0) + sampler (binding 1),
+        // because WGSL has no combined image sampler.
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        self.desc_layout = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+            .unwrap();
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1),
+        ];
+        self.desc_pool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+            .unwrap();
+        let layouts = [self.desc_layout];
+        self.desc_set = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.desc_pool)
+                    .set_layouts(&layouts),
+            )
+            .unwrap()[0];
+
+        // The grading LUT lives in its own set (group 1): the
+        // atlas set and every image set share group 0's layout,
+        // and the LUT must not have to be written into each.
+        let lut_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        self.lut_layout = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&lut_bindings),
+                None,
+            )
+            .unwrap();
+
+        // Set 2: the shape records (f3 D4). Set 0 is repinned per
+        // run — a texture and a pyramid target each own a set — so
+        // the one frame-wide storage buffer gets its own group, its
+        // own layout and its own one-set pool; the existing pools
+        // hold only SAMPLED_IMAGE and SAMPLER counts (R5).
+        let shapes_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        self.shapes_layout = self
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&shapes_bindings),
+                None,
+            )
+            .unwrap();
+        let shapes_pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)];
+        self.shapes_pool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&shapes_pool_sizes),
+                None,
+            )
+            .unwrap();
+        let shapes_layouts = [self.shapes_layout];
+        self.shapes_set = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.shapes_pool)
+                    .set_layouts(&shapes_layouts),
+            )
+            .unwrap()[0];
+
+        let pipes = create_pipeline(
+            &self.device,
+            self.render_pass,
+            self.desc_layout,
+            self.lut_layout,
+            self.shapes_layout,
+        );
+        self.pipeline_layout = pipes.layout;
+        self.pipes = pipes.by_pipe;
+
+        // Room for the application's images: browser frames,
+        // previews, a wallpaper. Freed individually as images go.
+        let tex_pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(96),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(96),
+        ];
+        self.tex_pool = self
+            .device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+                    .max_sets(96)
+                    .pool_sizes(&tex_pool_sizes),
+                None,
+            )
+            .unwrap();
+
+        // The identity LUT: two voxels an edge, each the colour of
+        // its own corner. Present from the first frame so the
+        // pipeline layout never has an unbound set; replaced in
+        // place when a .cube is chosen.
+        let (lut_image, lut_mem, lut_view) = create_lut_image(&self.device, &self.mem_props, 2)
+            .ok_or(GfxError::NoMemory("grading LUT"))?;
+        self.lut_image = lut_image;
+        self.lut_mem = lut_mem;
+        self.lut_view = lut_view;
+        let lut_set_layouts = [self.lut_layout];
+        self.lut_set = self
+            .device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.tex_pool)
+                    .set_layouts(&lut_set_layouts),
+            )
+            .unwrap()[0];
+
+        // Glyph atlas: R8, device-local.
+        let atlas_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8_UNORM)
+            .extent(vk::Extent3D {
+                width: ATLAS_W as u32,
+                height: ATLAS_H as u32,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        self.atlas_image = self.device.create_image(&atlas_info, None).unwrap();
+        let req = self.device.get_image_memory_requirements(self.atlas_image);
+        self.atlas_mem = alloc_memory(
+            &self.device,
+            &self.mem_props,
+            req,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or(GfxError::NoMemory("glyph atlas"))?;
+        self.device
+            .bind_image_memory(self.atlas_image, self.atlas_mem, 0)
+            .unwrap();
+        self.atlas_view = self
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(self.atlas_image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8_UNORM)
+                    .subresource_range(color_range()),
+                None,
+            )
+            .unwrap();
+
+        self.sampler = self
+            .device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+            .unwrap();
+
+        let tex_info = [vk::DescriptorImageInfo::default()
+            .image_view(self.atlas_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let samp_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&tex_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.desc_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&samp_info),
+        ];
+        self.device.update_descriptor_sets(&writes, &[]);
+        let lut_tex_info = [vk::DescriptorImageInfo::default()
+            .image_view(self.lut_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let lut_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.lut_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&lut_tex_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.lut_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(&samp_info),
+        ];
+        self.device.update_descriptor_sets(&lut_writes, &[]);
+
+        // Staging buffer for atlas uploads.
+        let (staging_buf, staging_mem, staging_ptr) = create_host_buffer(
+            &self.device,
+            &self.mem_props,
+            (ATLAS_W * ATLAS_H) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )
+        .ok_or(GfxError::NoMemory("atlas staging buffer"))?;
+        self.staging_buf = staging_buf;
+        self.staging_mem = staging_mem;
+        self.staging_ptr = staging_ptr;
+
+        // Vertex buffer (host-visible, persistently mapped).
+        let (vertex_buf, vertex_mem, vertex_ptr) = create_host_buffer(
+            &self.device,
+            &self.mem_props,
+            (MAX_VERTS * std::mem::size_of::<Vertex>()) as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )
+        .ok_or(GfxError::NoMemory("vertex buffer"))?;
+        self.vertex_buf = vertex_buf;
+        self.vertex_mem = vertex_mem;
+        self.vertex_ptr = vertex_ptr;
+
+        // Shape records: the same persistent mapping, written each
+        // frame beside the vertices, read by fs_shape through set 2.
+        let (shapes_buf, shapes_mem, shapes_ptr) = create_host_buffer(
+            &self.device,
+            &self.mem_props,
+            (MAX_SHAPES * std::mem::size_of::<Shape>()) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )
+        .ok_or(GfxError::NoMemory("shape record buffer"))?;
+        self.shapes_buf = shapes_buf;
+        self.shapes_mem = shapes_mem;
+        self.shapes_ptr = shapes_ptr;
+        let shapes_buf_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.shapes_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let shapes_write = [vk::WriteDescriptorSet::default()
+            .dst_set(self.shapes_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&shapes_buf_info)];
+        self.device.update_descriptor_sets(&shapes_write, &[]);
+
+        self.cmd_pool = self
+            .device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .unwrap();
+        self.cmd_buf = self
+            .device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .unwrap()[0];
+
+        self.sem_image = self
+            .device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            .unwrap();
+        self.sem_render = self
+            .device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            .unwrap();
+        self.fence = self
+            .device
+            .create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+            .unwrap();
+
+        // GPU timing, only if asked for. Two device facts decide
+        // whether it can work at all: the length of a tick
+        // (`timestampPeriod`, nanoseconds) and how many bits of a
+        // timestamp this queue family actually fills
+        // (`timestampValidBits`). The family is asked rather than
+        // the device-wide `timestampComputeAndGraphics`, because
+        // the family's answer is the exact one for the queue the
+        // frames go to; the device-wide promise is only reported.
+        let limits = vk.instance.get_physical_device_properties(self.pdevice).limits;
+        let valid_bits = vk
+            .instance
+            .get_physical_device_queue_family_properties(self.pdevice)
+            .get(queue_family as usize)
+            .map(|q| q.timestamp_valid_bits)
+            .unwrap_or(0);
+        self.timing = GpuTiming::from_env(
+            &self.device,
+            limits.timestamp_period,
+            valid_bits,
+            limits.timestamp_compute_and_graphics == vk::TRUE,
+            FRAMES_IN_FLIGHT,
+        );
+
+        Ok(())
     }
 
     pub fn resize(&mut self) {
@@ -798,8 +1064,122 @@ impl Gfx {
         self.blur_depth.clamp(1, 3) as u8
     }
 
+    /// Writes down what a [`Fault`] asks for. Never clears a flag —
+    /// two faults in one frame are two repairs, not the later one.
+    fn note(&mut self, f: Fault) {
+        self.needs_surface |= f.rebuilds_surface();
+        self.needs_recreate |= f.rebuilds_swapchain();
+    }
+
+    /// Builds a new surface for the same window after the old one was
+    /// lost, and everything that hung off it.
+    ///
+    /// A surface dies for reasons that have nothing to do with this
+    /// program: a monitor unplugged, a compositor restarted, a session
+    /// switched. Vulkan's answer to all of them is `SURFACE_LOST_KHR`
+    /// from whichever call happened to be next, and the only repair is
+    /// another surface — the handle itself is dead, not stale.
+    ///
+    /// The two semaphores are made anew here on purpose. A frame that
+    /// died at `queue_present` left `sem_render` signalled with nobody
+    /// ever going to wait on it, and the next frame's submit would
+    /// signal a signalled semaphore. The device is idle at this point,
+    /// so replacing them is free and it is the only moment in the frame
+    /// loop when it is.
+    ///
+    /// The outcome is read off the fields, not returned: a success
+    /// clears `needs_surface` and sets `needs_recreate`, a failure
+    /// leaves `needs_surface` standing and the extent at zero — which
+    /// is what makes `render` skip the frame rather than draw into
+    /// nothing, and what brings the next frame back here to try again.
+    ///
+    /// The teardown runs once per loss, not once per retry — AS FAR AS
+    /// `first_try` reaches, and that is not as far as it sounds. The
+    /// flag is `surface != null`, and the surface is only left null
+    /// when `create_surface` itself FAILED. Under Wayland and X11 that
+    /// call mostly just wraps the handles it is given
+    /// (`wl_display` + `wl_surface`, or an xcb connection and window)
+    /// and SUCCEEDS even for a window that is gone; the loss is then
+    /// reported by the next call that touches the surface for real.
+    /// So a window closed for good takes the other road: a surface is
+    /// made, `recreate_swapchain` meets `SURFACE_LOST` again, sets
+    /// `needs_surface` again, and the next frame tears the whole thing
+    /// down once more — device wait, blur targets, framebuffers,
+    /// views, swapchain, surface and both semaphores — sixty times a
+    /// second, and silently, because the message above sits only in
+    /// the branch where `create_surface` failed.
+    ///
+    /// NOT REPAIRED HERE, and named rather than left to be rediscovered:
+    /// the honest fix is a backoff on the repair itself — a surface
+    /// counts as proven only once a swapchain has been built on it, and
+    /// an unproven one is not retried on every frame. That is a state
+    /// machine, not a line, and this branch is a bugfix branch.
+    unsafe fn rebuild_surface(&mut self) {
+        let first_try = self.surface != vk::SurfaceKHR::null();
+        if first_try {
+            let _ = self.device.device_wait_idle();
+            self.destroy_blur_targets();
+            for fb in self.framebuffers.drain(..) {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            for v in self.views.drain(..) {
+                self.device.destroy_image_view(v, None);
+            }
+            // The swapchain first: it names the surface, so it cannot
+            // outlive it.
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+                self.swapchain = vk::SwapchainKHR::null();
+            }
+            self.images.clear();
+            self.surface_loader.destroy_surface(self.surface, None);
+            self.surface = vk::SurfaceKHR::null();
+            self.extent = vk::Extent2D { width: 0, height: 0 };
+
+            for s in [self.sem_image, self.sem_render] {
+                self.device.destroy_semaphore(s, None);
+            }
+            self.sem_image = self
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .unwrap();
+            self.sem_render = self
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .unwrap();
+        }
+
+        let Some(vk) = VK.get() else { return };
+        match ash_window::create_surface(
+            &vk.entry,
+            &vk.instance,
+            self.display_handle,
+            self.window_handle,
+            None,
+        ) {
+            Ok(s) => {
+                self.surface = s;
+                self.needs_surface = false;
+                self.needs_recreate = true;
+            }
+            Err(e) if first_try => {
+                eprintln!(
+                    "nacelle-renderer: the surface was lost and will not come back yet ({e:?}); \
+                     frames are skipped until it does"
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
     fn recreate_swapchain(&mut self, width: u32, height: u32) {
         unsafe {
+            // A surface that is gone answers nothing; asking it for
+            // capabilities below would only be the same loss again.
+            if self.surface == vk::SurfaceKHR::null() {
+                self.extent = vk::Extent2D { width: 0, height: 0 };
+                return;
+            }
             let _ = self.device.device_wait_idle();
             for fb in self.framebuffers.drain(..) {
                 self.device.destroy_framebuffer(fb, None);
@@ -811,9 +1191,32 @@ impl Gfx {
             // The depth preference may have moved since the last
             // build. A new format means a new render pass and new
             // pipelines — they are compiled against it.
-            if let Ok(formats) = self
+            //
+            // This is the FIRST of the three questions this function
+            // puts to the surface, and it is read like the other two.
+            // It used to be the exception — `if let Ok(..)`, no else —
+            // and a `SURFACE_LOST` from here was recorded nowhere: the
+            // old format was kept and the function walked on to ask a
+            // dead surface for its size. The loss was caught twenty
+            // lines down, so nothing broke; but a rule that holds for
+            // two of three neighbouring calls is a rule nobody will
+            // read as a rule.
+            let formats = match self
                 .surface_loader
                 .get_physical_device_surface_formats(self.pdevice, self.surface)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    let f = fault_of(e);
+                    if f.is_fatal() {
+                        eprintln!("nacelle-renderer: the surface will not say its formats: {e:?}");
+                    }
+                    self.extent = vk::Extent2D { width: 0, height: 0 };
+                    self.needs_recreate = true;
+                    self.needs_surface |= f.rebuilds_surface();
+                    return;
+                }
+            };
             {
                 let want = pick_format(&formats, self.depth_pref);
                 if want.format != self.format.format
@@ -847,10 +1250,26 @@ impl Gfx {
                 }
             }
 
-            let caps = self
+            // THE call that ended the desktop when a monitor was
+            // unplugged: a resize arrives, the surface is already gone,
+            // and asking a dead surface for its size answered
+            // SURFACE_LOST into an `unwrap`.
+            let caps = match self
                 .surface_loader
                 .get_physical_device_surface_capabilities(self.pdevice, self.surface)
-                .unwrap();
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let f = fault_of(e);
+                    if f.is_fatal() {
+                        eprintln!("nacelle-renderer: the surface will not say its size: {e:?}");
+                    }
+                    self.extent = vk::Extent2D { width: 0, height: 0 };
+                    self.needs_recreate = true;
+                    self.needs_surface |= f.rebuilds_surface();
+                    return;
+                }
+            };
             let extent = if caps.current_extent.width != u32::MAX {
                 caps.current_extent
             } else {
@@ -888,10 +1307,26 @@ impl Gfx {
                 .present_mode(vk::PresentModeKHR::FIFO)
                 .clipped(true)
                 .old_swapchain(old);
-            self.swapchain = self
-                .swapchain_loader
-                .create_swapchain(&info, None)
-                .expect("cannot create swapchain");
+            self.swapchain = match self.swapchain_loader.create_swapchain(&info, None) {
+                Ok(s) => s,
+                Err(e) => {
+                    // The same reasoning as the capabilities call: a
+                    // swapchain refused for a surface that died between
+                    // the two calls is a repair, not an ending.
+                    let f = fault_of(e);
+                    if f.is_fatal() {
+                        eprintln!("nacelle-renderer: cannot create a swapchain: {e:?}");
+                    }
+                    if old != vk::SwapchainKHR::null() {
+                        self.swapchain_loader.destroy_swapchain(old, None);
+                        self.swapchain = vk::SwapchainKHR::null();
+                    }
+                    self.extent = vk::Extent2D { width: 0, height: 0 };
+                    self.needs_recreate = true;
+                    self.needs_surface |= f.rebuilds_surface();
+                    return;
+                }
+            };
             if old != vk::SwapchainKHR::null() {
                 self.swapchain_loader.destroy_swapchain(old, None);
             }
@@ -936,6 +1371,13 @@ impl Gfx {
     /// (Re)builds the frosted-glass chain for the current extent and
     /// format: the base scene at full size and the half / quarter /
     /// eighth pyramid the blur is made of.
+    ///
+    /// A chain that cannot be built leaves the vector EMPTY rather than
+    /// half-built, and that is already a state the frame path knows:
+    /// the base-scene split asks for `blur_targets.len() == 4` before
+    /// it fires and the rank lookup goes through `get`. So a device
+    /// with no memory for the pyramid draws every frosted surface flat
+    /// instead of ending the desktop.
     unsafe fn rebuild_blur_targets(&mut self) {
         self.destroy_blur_targets();
         let (w, h) = (self.extent.width, self.extent.height);
@@ -955,12 +1397,17 @@ impl Gfx {
                 .initial_layout(vk::ImageLayout::UNDEFINED);
             let image = self.device.create_image(&info, None).unwrap();
             let req = self.device.get_image_memory_requirements(image);
-            let mem = alloc_memory(
+            let Some(mem) = alloc_memory(
                 &self.device,
                 &self.mem_props,
                 req,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
+            ) else {
+                self.device.destroy_image(image, None);
+                eprintln!("nacelle-renderer: no GPU memory for the blur chain; glass draws flat");
+                self.destroy_blur_targets();
+                return;
+            };
             self.device.bind_image_memory(image, mem, 0).unwrap();
             let view = self
                 .device
@@ -1044,6 +1491,13 @@ impl Gfx {
         clear: [f32; 4],
     ) {
         unsafe {
+            // Surface before swapchain: the second hangs off the first,
+            // so a swapchain built while the surface is still dead is
+            // one more dead thing. `rebuild_surface` sets
+            // `needs_recreate` itself when it succeeds.
+            if self.needs_surface {
+                self.rebuild_surface();
+            }
             if self.needs_recreate {
                 self.recreate_swapchain(width, height);
             }
@@ -1092,13 +1546,16 @@ impl Gfx {
             );
             let image_index = match acquired {
                 Ok((idx, _)) => idx,
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                Err(e) => {
+                    let f = fault_of(e);
+                    if f.is_fatal() {
+                        panic!("acquire_next_image: {e:?}");
+                    }
                     // Fence already waited above: staging is ours to write.
                     self.stash_atlas_rows(atlas);
-                    self.needs_recreate = true;
+                    self.note(f);
                     return;
                 }
-                Err(e) => panic!("acquire_next_image: {e:?}"),
             };
 
             self.device.reset_fences(&[self.fence]).unwrap();
@@ -1395,8 +1852,13 @@ impl Gfx {
                         self.needs_recreate = true;
                     }
                 }
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.needs_recreate = true,
-                Err(e) => panic!("queue_present: {e:?}"),
+                Err(e) => {
+                    let f = fault_of(e);
+                    if f.is_fatal() {
+                        panic!("queue_present: {e:?}");
+                    }
+                    self.note(f);
+                }
             }
         }
     }
@@ -1636,10 +2098,18 @@ impl Gfx {
         let current_edge = if self.lut_initialized { self.lut_edge() } else { 0 };
         if current_edge != size {
             let _ = self.device.device_wait_idle();
+            // Built BEFORE the old one is let go. The other order —
+            // which is what stood here — hands the fields three dead
+            // handles the moment the new image cannot be had, and every
+            // later frame samples them.
+            let Some((img, mem, view)) = create_lut_image(&self.device, &self.mem_props, size)
+            else {
+                eprintln!("nacelle-renderer: no GPU memory for a {size}-edge grading LUT; keeping the old one");
+                return;
+            };
             self.device.destroy_image_view(self.lut_view, None);
             self.device.destroy_image(self.lut_image, None);
             self.device.free_memory(self.lut_mem, None);
-            let (img, mem, view) = create_lut_image(&self.device, &self.mem_props, size);
             self.lut_image = img;
             self.lut_mem = mem;
             self.lut_view = view;
@@ -1654,12 +2124,15 @@ impl Gfx {
                 .image_info(&info)];
             self.device.update_descriptor_sets(&writes, &[]);
         }
-        let (buf, mem, ptr) = create_host_buffer(
+        let Some((buf, mem, ptr)) = create_host_buffer(
             &self.device,
             &self.mem_props,
             bytes.len() as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
-        );
+        ) else {
+            eprintln!("nacelle-renderer: no staging memory for the grading LUT; it stays as it was");
+            return;
+        };
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
         let to_dst = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
@@ -1723,11 +2196,22 @@ impl Gfx {
 
     /// Registers an RGBA image of the given size. The handle is what
     /// [`nacelle::draw::DrawList::image`] takes; pixels arrive through
-    /// [`Gfx::update_texture`]. No widget consumes these yet — they are
-    /// the renderer's half of the image contract, waiting for the
-    /// first image-drawing widget (the browser is the planned one).
+    /// [`Gfx::update_texture`].
+    ///
+    /// IT HAS CALLERS, and the `allow` below says nothing to the
+    /// contrary — `dead_code` only ever looked inside this crate. The
+    /// live one is `nacelle-desktop`'s `install_plate` (screen.rs),
+    /// which registers the two theme plates, "backdrop" and "overlay",
+    /// and re-registers them whenever a theme swap or a resize changes
+    /// their size. A branch that reads the `allow` as "no callers" and
+    /// changes the signature breaks that file; this note is here
+    /// because one already did.
+    ///
+    /// `None` when the device has no memory for the image. A caller
+    /// that asked for a wallpaper and did not get one has a picture to
+    /// leave out; it does not have a desktop to end.
     #[allow(dead_code)]
-    pub fn create_texture(&mut self, w: u32, h: u32) -> nacelle::draw::ImageId {
+    pub fn create_texture(&mut self, w: u32, h: u32) -> Option<nacelle::draw::ImageId> {
         // The band at the top of the id space is renderer instructions
         // (glass ranks, ADD_ATLAS), never a registered texture — handing
         // one out would silently alias a sentinel (r1 §0.1).
@@ -1748,12 +2232,16 @@ impl Gfx {
                 .initial_layout(vk::ImageLayout::UNDEFINED);
             let image = self.device.create_image(&info, None).unwrap();
             let req = self.device.get_image_memory_requirements(image);
-            let mem = alloc_memory(
+            let Some(mem) = alloc_memory(
                 &self.device,
                 &self.mem_props,
                 req,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
+            ) else {
+                self.device.destroy_image(image, None);
+                eprintln!("nacelle-renderer: no GPU memory for a {w}x{h} image");
+                return None;
+            };
             self.device.bind_image_memory(image, mem, 0).unwrap();
             let view = self
                 .device
@@ -1808,7 +2296,7 @@ impl Gfx {
                     initialized: false,
                 },
             );
-            nacelle::draw::ImageId(id)
+            Some(nacelle::draw::ImageId(id))
         }
     }
 
@@ -1871,12 +2359,21 @@ impl Gfx {
                     tex.initialized,
                 )
             };
-            let (buf, mem, ptr) = create_host_buffer(
+            let Some((buf, mem, ptr)) = create_host_buffer(
                 &self.device,
                 &self.mem_props,
                 data.len() as u64,
                 vk::BufferUsageFlags::TRANSFER_SRC,
-            );
+            ) else {
+                // The pixels go back on the queue: the next frame is
+                // another chance, and the image keeps the picture it
+                // had until one of them takes.
+                if let Some(tex) = self.textures.get_mut(&id) {
+                    tex.pending = Some(data);
+                }
+                eprintln!("nacelle-renderer: no staging memory for image {id}; upload deferred");
+                continue;
+            };
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
             let to_dst = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
@@ -2709,11 +3206,13 @@ fn create_pipeline(
 }
 
 /// A 3D image for the grading LUT: RGBA float voxels, `size` an edge.
+/// `None` when the device has no memory for it — the image handle is
+/// destroyed on that path, so nothing is left dangling.
 fn create_lut_image(
     device: &ash::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     size: u32,
-) -> (vk::Image, vk::DeviceMemory, vk::ImageView) {
+) -> Option<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     unsafe {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_3D)
@@ -2727,7 +3226,11 @@ fn create_lut_image(
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = device.create_image(&info, None).unwrap();
         let req = device.get_image_memory_requirements(image);
-        let mem = alloc_memory(device, mem_props, req, vk::MemoryPropertyFlags::DEVICE_LOCAL);
+        let Some(mem) = alloc_memory(device, mem_props, req, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        else {
+            device.destroy_image(image, None);
+            return None;
+        };
         device.bind_image_memory(image, mem, 0).unwrap();
         let view = device
             .create_image_view(
@@ -2739,7 +3242,7 @@ fn create_lut_image(
                 None,
             )
             .unwrap();
-        (image, mem, view)
+        Some((image, mem, view))
     }
 }
 
@@ -2853,45 +3356,55 @@ fn format_bits(f: vk::Format) -> u32 {
     }
 }
 
+/// The first memory type an object may use that also has every flag
+/// asked for, or `None` when this device offers no such type.
+///
+/// `None` and not a panic: the caller is always in a position to say
+/// something better than "the process is over". At build time that is a
+/// [`GfxError`] the desktop can print; at frame time it is one feature
+/// switched off — a texture not registered, a blur chain not built —
+/// while the picture goes on being drawn.
 fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
     flags: vk::MemoryPropertyFlags,
-) -> u32 {
-    for i in 0..props.memory_type_count {
-        if type_bits & (1 << i) != 0
+) -> Option<u32> {
+    (0..props.memory_type_count).find(|&i| {
+        type_bits & (1 << i) != 0
             && props.memory_types[i as usize].property_flags.contains(flags)
-        {
-            return i;
-        }
-    }
-    panic!("no suitable GPU memory type");
+    })
 }
 
+/// Memory for one object, or `None` when the device has no type for it
+/// or refuses the allocation.
 fn alloc_memory(
     device: &ash::Device,
     props: &vk::PhysicalDeviceMemoryProperties,
     req: vk::MemoryRequirements,
     flags: vk::MemoryPropertyFlags,
-) -> vk::DeviceMemory {
+) -> Option<vk::DeviceMemory> {
+    let ty = find_memory_type(props, req.memory_type_bits, flags)?;
     unsafe {
         device
             .allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
-                    .memory_type_index(find_memory_type(props, req.memory_type_bits, flags)),
+                    .memory_type_index(ty),
                 None,
             )
-            .unwrap()
+            .ok()
     }
 }
 
+/// A host-visible, persistently mapped buffer, or `None` when the
+/// device has no memory for it. The buffer handle is destroyed on the
+/// way out of the failing path, so a `None` leaves nothing behind.
 fn create_host_buffer(
     device: &ash::Device,
     props: &vk::PhysicalDeviceMemoryProperties,
     size: u64,
     usage: vk::BufferUsageFlags,
-) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
+) -> Option<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
     unsafe {
         let buf = device
             .create_buffer(
@@ -2901,27 +3414,30 @@ fn create_host_buffer(
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
-            .unwrap();
+            .ok()?;
         let req = device.get_buffer_memory_requirements(buf);
-        let mem = alloc_memory(
+        let Some(mem) = alloc_memory(
             device,
             props,
             req,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        );
+        ) else {
+            device.destroy_buffer(buf, None);
+            return None;
+        };
         device.bind_buffer_memory(buf, mem, 0).unwrap();
         let ptr = device
             .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
             .unwrap() as *mut u8;
-        (buf, mem, ptr)
+        Some((buf, mem, ptr))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_bits, glass_rank, glass_target, is_glass, parse_cube, pick_format, pipe_of,
-        pyramid_steps, run_kind, scissor_for, vk, Pipe, RunKind,
+        fault_of, find_memory_type, format_bits, glass_rank, glass_target, is_glass, parse_cube,
+        pick_format, pipe_of, pyramid_steps, run_kind, scissor_for, vk, Fault, Pipe, RunKind,
     };
     use nacelle::draw::{
         ImageId, ADD_ATLAS, BLUR_IMAGE, GLASS_RANK_1, GLASS_RANK_2, GLASS_RANK_3, SHAPE,
@@ -3242,5 +3758,261 @@ mod tests {
                  number reported was not the one in the buffer"
             );
         }
+    }
+
+    /// **Unplugging a monitor must not end the desktop.**
+    ///
+    /// A surface dies for reasons that are nobody's fault and nobody's
+    /// bug: a cable pulled, a compositor restarted, a session switched.
+    /// Vulkan says so with `ERROR_SURFACE_LOST_KHR` out of whichever
+    /// call came next — `acquire_next_image`, `queue_present`, or the
+    /// capabilities query inside the swapchain rebuild — and every one
+    /// of those three sites used to hand it to a `panic!` or an
+    /// `unwrap`. One unplugged screen, no desktop.
+    ///
+    /// The two recoverable answers are not interchangeable, and the
+    /// asymmetry is the point of the second half of this test: a
+    /// swapchain can be rebuilt without touching the surface, but a
+    /// surface cannot be rebuilt without also rebuilding the swapchain
+    /// that names it. A `Fault::Surface` that asked for only the first
+    /// repair would leave a live swapchain pointing at a dead surface
+    /// — and the frame after would fail in exactly the same way, for
+    /// ever.
+    #[test]
+    fn a_lost_surface_is_a_repair_and_only_the_unknown_is_fatal() {
+        assert_eq!(fault_of(vk::Result::ERROR_SURFACE_LOST_KHR), Fault::Surface);
+        assert_eq!(fault_of(vk::Result::ERROR_OUT_OF_DATE_KHR), Fault::Swapchain);
+        // A driver may hand SUBOPTIMAL back as an error rather than in
+        // the success value; a renderer that died of a merely stretched
+        // picture would be the same bug in a smaller coat.
+        assert_eq!(fault_of(vk::Result::SUBOPTIMAL_KHR), Fault::Swapchain);
+
+        // Nothing else is guessed at. A lost device or an exhausted
+        // heap is not a thing this renderer knows how to repair, and
+        // pretending otherwise would spin the frame loop for ever.
+        for e in [
+            vk::Result::ERROR_DEVICE_LOST,
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_INITIALIZATION_FAILED,
+        ] {
+            assert_eq!(fault_of(e), Fault::Fatal, "{e:?} was given a repair it has none of");
+        }
+
+        // The ordering, stated as the two questions the frame asks.
+        assert!(Fault::Surface.rebuilds_surface());
+        assert!(
+            Fault::Surface.rebuilds_swapchain(),
+            "a swapchain over a surface that was just replaced is a dead swapchain"
+        );
+        assert!(!Fault::Swapchain.rebuilds_surface(), "a resize costs no surface");
+        assert!(Fault::Swapchain.rebuilds_swapchain());
+        assert!(!Fault::Surface.is_fatal());
+        assert!(!Fault::Swapchain.is_fatal());
+        assert!(Fault::Fatal.is_fatal());
+        assert!(
+            !Fault::Fatal.rebuilds_surface() && !Fault::Fatal.rebuilds_swapchain(),
+            "a fault with no repair must not also ask for one"
+        );
+    }
+
+    /// **A memory type that does not exist is an answer, not an
+    /// ending.**
+    ///
+    /// The search used to end the process on its own authority, from
+    /// the bottom of a helper that has no idea what it was allocating
+    /// for. Now it says `None` and the caller decides: a [`GfxError`]
+    /// before the first frame, one feature switched off after it.
+    ///
+    /// The positive halves matter as much. `type_bits` is a MASK from
+    /// `vkGetImageMemoryRequirements` — an allocator that ignored it
+    /// would hand back a type the object may not legally use — and the
+    /// flags are a SUBSET test, not equality: a heap with more
+    /// properties than were asked for is still a heap that will do.
+    #[test]
+    fn a_missing_memory_type_answers_none_instead_of_ending_the_process() {
+        use vk::MemoryPropertyFlags as F;
+        let ty = |flags| vk::MemoryType { property_flags: flags, heap_index: 0 };
+        let mut props = vk::PhysicalDeviceMemoryProperties::default();
+        props.memory_type_count = 3;
+        props.memory_types[0] = ty(F::DEVICE_LOCAL);
+        props.memory_types[1] = ty(F::HOST_VISIBLE);
+        props.memory_types[2] = ty(F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED);
+
+        // The case that used to be a panic: this device has no
+        // host-coherent type the object is allowed to use.
+        assert_eq!(find_memory_type(&props, 0b011, F::HOST_COHERENT), None);
+        // …and the same when the object may use nothing at all.
+        assert_eq!(find_memory_type(&props, 0, F::DEVICE_LOCAL), None);
+        // …and when the device reports no types whatsoever, which is
+        // what a software rasteriser stub looks like from here.
+        let empty = vk::PhysicalDeviceMemoryProperties::default();
+        assert_eq!(find_memory_type(&empty, u32::MAX, F::DEVICE_LOCAL), None);
+
+        // The mask is obeyed: type 0 fits the flags and is forbidden.
+        assert_eq!(find_memory_type(&props, 0b110, F::DEVICE_LOCAL), None);
+        assert_eq!(find_memory_type(&props, 0b111, F::DEVICE_LOCAL), Some(0));
+        // Extra properties do not disqualify a type.
+        assert_eq!(
+            find_memory_type(&props, 0b111, F::HOST_VISIBLE | F::HOST_COHERENT),
+            Some(2)
+        );
+        // The FIRST match wins, and drivers order these best-first.
+        assert_eq!(find_memory_type(&props, 0b111, F::HOST_VISIBLE), Some(1));
+        // Nothing past `memory_type_count` is read, whatever the array
+        // happens to hold — the array is 32 long on every device.
+        let mut short = props;
+        short.memory_type_count = 1;
+        assert_eq!(find_memory_type(&short, 0b111, F::HOST_VISIBLE), None);
+    }
+
+    /// **A construction that fails after the device exists must have
+    /// something to give the device back to.**
+    ///
+    /// Turning the constructor's panics into errors moved the fault
+    /// instead of repairing it. A `?` out of the middle of a
+    /// constructor drops NOTHING — the struct whose `Drop` destroys
+    /// the device has not been built yet — so every one of those exits
+    /// walked out on a `VkDevice`, a `VkSurfaceKHR` and everything
+    /// made in between, for the life of the process. Panics had hidden
+    /// that: the process ended and the kernel swept up. The whole
+    /// point of the change is a caller that goes ON, and a desktop that
+    /// skips one unusable monitor per plug event would have leaked a
+    /// device per event.
+    ///
+    /// The repair is structural, so the guard is too: the fallible
+    /// steps live in `furnish`, which fills an ALREADY-BUILT `Gfx`, and
+    /// the only exits left in `new` itself are the three before the
+    /// device exists — each handing the surface back by name, because
+    /// at that moment nothing else can.
+    ///
+    /// This reads the source rather than running the constructor
+    /// because running it needs a GPU, and the property is about which
+    /// LINE a failure leaves from. Checked red against the code it
+    /// replaces: on the old `new`, the seven `?` exits between the
+    /// device and the struct trip the first assertion and the absent
+    /// named exits trip the second.
+    #[test]
+    fn no_construction_step_can_fail_before_there_is_a_drop_to_catch_it() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gfx.rs"))
+            .expect("this file");
+        let start = src.find("    pub fn new(").expect("Gfx::new");
+        let struct_at = src[start..]
+            .find("let mut gfx = Gfx {")
+            .expect("Gfx::new builds a Gfx")
+            + start;
+        let device_at = src[start..]
+            .find("let queue = device.get_device_queue")
+            .expect("Gfx::new creates a logical device")
+            + start;
+        assert!(
+            device_at < struct_at,
+            "the device is made after the struct, and this test no longer knows what it is reading"
+        );
+
+        // Nothing between the device and the struct may fail by `?`:
+        // there is no `Drop` yet, so such an exit is a leak by
+        // construction.
+        let between = &src[device_at..struct_at];
+        for leaky in [".map_err(GfxError::", ".ok_or(GfxError::", "?;"] {
+            assert!(
+                !between.contains(leaky),
+                "`{leaky}` sits between the logical device and the struct whose Drop frees it; \
+                 that exit leaks a VkDevice and a VkSurfaceKHR. Move the step into `furnish`."
+            );
+        }
+
+        // And the exits that come BEFORE the struct hand the surface
+        // back themselves, because at that point nothing else will.
+        let head: Vec<&str> = src[start..struct_at].lines().collect();
+        let mut named = 0;
+        for (i, line) in head.iter().enumerate() {
+            if line.contains("return Err(GfxError::") {
+                named += 1;
+                assert!(
+                    head[..i]
+                        .iter()
+                        .rev()
+                        .take(3)
+                        .any(|l| l.contains("destroy_surface")),
+                    "an exit from Gfx::new walks out on the surface: {}",
+                    line.trim()
+                );
+            }
+        }
+        assert!(
+            named > 0,
+            "Gfx::new has no named exit at all — either the surface is created later than this \
+             test believes, or the guard is reading nothing and passing"
+        );
+    }
+
+    /// **The number in the package description is the number of
+    /// pipelines the device is actually asked for.**
+    ///
+    /// Both the README and the manifest said "two pipelines" long after
+    /// there were seven, and the module header said "six" — it had
+    /// counted every lane except the frosted band. Prose about a
+    /// number drifts silently, so the number gets a reader: [`Pipe::N`]
+    /// is what `create_graphics_pipelines` is handed, and this is what
+    /// makes the sentence answer to it.
+    #[test]
+    fn the_advertised_pipeline_count_is_the_one_the_device_gets() {
+        const NAMES: [&str; 11] = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        ];
+        let word = NAMES[Pipe::N];
+
+        let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("the crate's own manifest");
+        let desc = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("description"))
+            .expect("the manifest describes the crate");
+        assert!(
+            desc.contains(&format!("{word} pipelines")),
+            "the manifest advertises a pipeline count that is not {word}: {desc}"
+        );
+
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("the crate's own README");
+        assert!(
+            readme.contains(&format!("{word} pipelines")),
+            "the README advertises a pipeline count that is not {word}"
+        );
+
+        // The THIRD sentence about the same number, and the one that
+        // had actually drifted: this file's own header. Leaving it out
+        // of the guard was the flaw in the first version of this test —
+        // it tied down the two sentences that were wrong and left free
+        // the one that had already gone wrong once. Case-folded because
+        // the header shouts the number.
+        let header = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gfx.rs"))
+            .expect("this file")
+            .lines()
+            .take_while(|l| l.starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase();
+        assert!(
+            !header.is_empty(),
+            "the module header is gone, and with it the sentence this guards"
+        );
+        assert!(
+            header.contains(&format!("{word} pipelines")),
+            "the header of gfx.rs advertises a pipeline count that is not {word}"
+        );
+
+        // The sibling list is part of the same drift. `nacelle-widgets`
+        // was renamed to `nacelle-addons` and the link went on pointing
+        // at a repository that does not exist.
+        assert!(
+            readme.contains("nacelle-addons"),
+            "the README does not name the addons repository"
+        );
+        assert!(
+            !readme.contains("nacelle-widgets"),
+            "the README still links a repository that was renamed away"
+        );
     }
 }
