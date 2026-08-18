@@ -1034,6 +1034,19 @@ mod tests {
     /// names is one pipeline per kind, keyed on the run; until that
     /// exists a Box record pays for a hexagon it will never draw.
     ///
+    /// **The soft profiles moved it once more, and by the same
+    /// mechanism.** `shape_alpha` computes the gaussian, the crisp ramp
+    /// and the outside mask on every fragment and `select`s between
+    /// them, for the reason every other branch on this lane is a
+    /// select: the record's bits are not uniform across a draw.
+    /// Reachable compute 161 → 187 and ALU 114 → 135; one `Exp` joined
+    /// the GLSL calls, and it is the only instruction here that is
+    /// there for the glow ALONE. Twenty-six instructions is what the
+    /// crisp lane now pays for a feature it never uses — the same debt
+    /// the kinds took on, answerable by the same remedy (a pipeline per
+    /// shape of record) and not answered here: this step adds a
+    /// capability, and the owner put optimisation last.
+    ///
     /// Which is also the lesson for whoever pins the next one: on an
     /// entry point that calls anything, `own` measures where the code
     /// was WRITTEN and `total` measures what the fragment DOES. A
@@ -1046,15 +1059,15 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "fs_shape")
             .expect("fs_shape is missing");
-        assert_eq!(shape.total.compute(), 161, "the field's work changed");
-        assert_eq!(shape.total.class(Class::Alu), 114, "the field's ALU changed");
+        assert_eq!(shape.total.compute(), 187, "the field's work changed");
+        assert_eq!(shape.total.class(Class::Alu), 135, "the field's ALU changed");
         // And the body itself is now scaffolding: a handful of loads
         // and four calls. If this grows, the mathematics came back —
         // which is the second copy K3b existed to prevent.
         assert!(shape.own.compute() < 20, "the field moved back into the body");
         assert_eq!(
             shape.callees,
-            vec!["grade", "shape_compose", "shape_cover", "shape_field"],
+            vec!["grade", "shape_alpha", "shape_compose", "shape_cover", "shape_field"],
             "the plain lane's callees are the shared forms and the grade"
         );
         // The frosted entry point calls the SAME field, and its extra
@@ -1067,7 +1080,7 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "fs_shape_glass")
             .expect("fs_shape_glass is missing");
-        assert_eq!(glass.total.compute(), 177, "the frosted lane's work changed");
+        assert_eq!(glass.total.compute(), 203, "the frosted lane's work changed");
         assert!(
             glass.callees.contains(&"shape_field".to_string()),
             "the frosted entry point stopped sharing the field"
@@ -1171,23 +1184,29 @@ mod tests {
     /// kind would break the derivative uniformity `shape_cover` needs —
     /// so every fragment of every record now evaluates the arc, the
     /// hexagon and the chevron as well as the box. The whole fragments
-    /// are **161 against 13, a ratio of 12.4**, and that is the number
-    /// to hold up against a frame time. Everything the measurement note
-    /// derives per silhouette (the 4.25x, the perimeter-to-area
-    /// argument) was computed on the 6.7 and has NOT been re-run here.
+    /// were then **161 against 13, a ratio of 12.4**.
+    ///
+    /// **The soft profiles moved it a third time, for the same reason
+    /// and by 26 instructions**: `shape_alpha` evaluates the gaussian,
+    /// the crisp ramp and the outside mask on every fragment and
+    /// selects. Today the whole fragments are **187 against 13, a ratio
+    /// of 14.4**, and that is the number to hold up against a frame
+    /// time. Everything the measurement note derives per silhouette
+    /// (the 4.25x, the perimeter-to-area argument) was computed on the
+    /// 6.7 and has NOT been re-run — not here, and not at K6 either.
     ///
     /// Two things the ratio hides, both in the vector lane's favour:
     ///
     /// * `fs_shape` takes ONE texture sample where `fs_main` takes two
     ///   — it reads no atlas. A sample is a memory trip, not an ALU
-    ///   slot, so the trade is 148 arithmetic instructions against one
+    ///   slot, so the trade is 174 arithmetic instructions against one
     ///   fetch, and which side that lands on is a property of the
     ///   device's occupancy rather than of this count.
-    /// * Of the fragment's 330 instructions only 161 are compute; the
+    /// * Of the fragment's 367 instructions only 187 are compute; the
     ///   rest are loads, access chains and composite shuffles that
     ///   `mem2reg` deletes before the hardware sees them. The count is
     ///   an upper bound on ALU (this module's own header says so), and
-    ///   43 of the 161 are `GLSL.std.450` calls the hardware weighs its
+    ///   48 of the 187 are `GLSL.std.450` calls the hardware weighs its
     ///   own way — six of them `length`, a dot and a square root each —
     ///   so the hardware-weighted figure moves in both directions and
     ///   cannot be settled from here at all.
@@ -1206,9 +1225,9 @@ mod tests {
         // The whole-fragment comparison: what the GPU actually runs,
         // grade included, because both lanes run it.
         assert_eq!(fs_main.total.compute(), 13, "the plain fill lane moved");
-        assert_eq!(fs_shape.total.compute(), 161, "the shape lane moved");
+        assert_eq!(fs_shape.total.compute(), 187, "the shape lane moved");
         assert_eq!(fs_main.total.total(), 54);
-        assert_eq!(fs_shape.total.total(), 330);
+        assert_eq!(fs_shape.total.total(), 367);
 
         // The bodies, which are no longer the lanes: one reads a
         // texture and grades it, the other is four calls.
@@ -1221,9 +1240,18 @@ mod tests {
 
         // And the shape of the shape lane's cost, so a rewrite that
         // keeps the total and moves the mix is still visible.
-        assert_eq!(fs_shape.total.class(Class::Alu), 114);
-        assert_eq!(fs_shape.total.class(Class::Math), 43);
+        assert_eq!(fs_shape.total.class(Class::Alu), 135);
+        assert_eq!(fs_shape.total.class(Class::Math), 48);
         assert_eq!(fs_shape.total.class(Class::Deriv), 2);
+        // The one instruction on this lane that exists for the GLOW
+        // and for nothing else. Everything else the soft profiles cost
+        // is `select` and arithmetic the crisp path was already doing
+        // in some form; the transcendental is not.
+        assert_eq!(
+            fs_shape.total.glsl().iter().find(|(n, _)| n == "Exp").map(|(_, c)| *c),
+            Some(1),
+            "the gaussian profile lost its exponential"
+        );
         assert_eq!(fs_shape.own.class(Class::Texture), 0);
         assert_eq!(
             fs_shape.total.glsl().iter().find(|(n, _)| n == "Length").map(|(_, c)| *c),

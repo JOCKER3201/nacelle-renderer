@@ -359,6 +359,7 @@ impl<'a> Field<'a> {
                 match fun {
                     M::Abs => broadcast(a, V::F(0.0), |x, _| x.abs()),
                     M::Sqrt => broadcast(a, V::F(0.0), |x, _| x.sqrt()),
+                    M::Exp => broadcast(a, V::F(0.0), |x, _| x.exp()),
                     M::Sin => V::F(a.f().sin()),
                     M::Cos => V::F(a.f().cos()),
                     M::Min => broadcast(a, b.expect("min takes two"), f32::min),
@@ -414,6 +415,19 @@ impl Field<'_> {
             V::F(rec.arc_half),
             V::F(rec.arc_dir),
         ])
+    }
+
+    /// The coverage `shape_alpha` computes — the soft profiles' half of
+    /// the fragment (f3 §2.6), reachable here for exactly the reason
+    /// the field is: it takes the AA width as an argument instead of
+    /// asking the rasteriser for a derivative, so there is nothing in
+    /// it a CPU cannot evaluate.
+    ///
+    /// `flags` carries the two bits it reads, `OUTSIDE_ONLY` (14) and
+    /// `GAUSS` (15); the rest are ignored by that function and passing
+    /// them changes nothing, which is itself worth asserting.
+    pub fn alpha(&mut self, d: f32, w: f32, feather: f32, flags: u32) -> f32 {
+        self.call(vec![V::F(d), V::F(w), V::F(feather), V::U(flags)])
     }
 }
 
