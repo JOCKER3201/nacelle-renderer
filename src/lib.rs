@@ -11,6 +11,11 @@
 //! window handles and pixel sizes, which is what lets the same crate
 //! serve a winit application today and the project's own compositor
 //! tomorrow.
+//!
+//! What it does NOT do is end the process on the machine's behalf.
+//! [`Gfx::new`] fails with a [`GfxError`] a caller can print, and a
+//! surface that dies mid-session — an unplugged monitor, a restarted
+//! compositor — is rebuilt from the handles the constructor was given.
 
 mod gfx;
 mod shaders;
@@ -29,4 +34,4 @@ mod timing;
 /// it answers questions about shaders this crate does not itself carry.
 pub mod spirvstat;
 
-pub use gfx::{parse_cube, Gfx};
+pub use gfx::{parse_cube, Gfx, GfxError};
